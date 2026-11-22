@@ -2105,6 +2105,202 @@ class TestPathTools(unittest.TestCase):
         self.assertTrue(enclosing_shape.is_contained_by(larger_shape))
 
 
+class TestPointInPath(unittest.TestCase):
+    """Tests for the fill-rule based hit test point_in_path()."""
+
+    @staticmethod
+    def square(start=0+0j, size=10.0, ccw=True):
+        x0, y0 = start.real, start.imag
+        s = size
+        corners = [x0+y0*1j, (x0+s)+y0*1j, (x0+s)+(y0+s)*1j,
+                   x0+(y0+s)*1j]
+        if not ccw:
+            corners = corners[::-1]
+        return Path(*[Line(corners[i], corners[(i+1) % 4])
+                      for i in range(4)])
+
+    def test_basic_inside_outside_boundary(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE, POINT_ON_BOUNDARY)
+        path = self.square()
+        self.assertEqual(point_in_path(5+5j, path), POINT_INSIDE)
+        self.assertEqual(point_in_path(15+5j, path), POINT_OUTSIDE)
+        # edge and corner points are boundary, not inside
+        self.assertEqual(point_in_path(0+5j, path), POINT_ON_BOUNDARY)
+        self.assertEqual(point_in_path(0+0j, path), POINT_ON_BOUNDARY)
+        self.assertEqual(point_in_path(10+10j, path), POINT_ON_BOUNDARY)
+
+    def test_fill_rule_values_and_default(self):
+        from svgpathtools import point_in_path
+        path = self.square()
+        # default fill rule is nonzero
+        self.assertEqual(point_in_path(5+5j, path),
+                         point_in_path(5+5j, path, 'nonzero'))
+        with self.assertRaises(ValueError):
+            point_in_path(5+5j, path, fill_rule='winding')
+        with self.assertRaises(ValueError):
+            point_in_path(5+5j, path, boundary_tol=-1.0)
+        with self.assertRaises(TypeError):
+            point_in_path(5+5j, [])
+        self.assertEqual(point_in_path(5+5j, Path()), 0)
+
+    def test_hole_opposite_and_same_orientation(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE)
+        outer = self.square(size=10.0, ccw=True)
+        inner_cw = self.square(start=3+3j, size=4.0, ccw=False)
+        inner_ccw = self.square(start=3+3j, size=4.0, ccw=True)
+        hole_path = Path(*(list(outer) + list(inner_cw)))
+        same_dir_path = Path(*(list(outer) + list(inner_ccw)))
+
+        outer_pt, hole_pt = 1+1j, 5+5j
+        # reverse-oriented inner contour cuts a hole under nonzero,
+        # and a hole under evenodd regardless of direction
+        self.assertEqual(point_in_path(outer_pt, hole_path, 'nonzero'),
+                         POINT_INSIDE)
+        self.assertEqual(point_in_path(hole_pt, hole_path, 'nonzero'),
+                         POINT_OUTSIDE)
+        self.assertEqual(point_in_path(hole_pt, hole_path, 'evenodd'),
+                         POINT_OUTSIDE)
+        # same-oriented inner contour stays filled under nonzero but is a
+        # hole under evenodd
+        self.assertEqual(point_in_path(hole_pt, same_dir_path, 'nonzero'),
+                         POINT_INSIDE)
+        self.assertEqual(point_in_path(hole_pt, same_dir_path, 'evenodd'),
+                         POINT_OUTSIDE)
+
+    def test_self_intersecting_contour(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE, POINT_ON_BOUNDARY)
+        # bowtie: (0,0) -> (10,10) -> (0,10) -> (10,0), crossing at (5,5)
+        bowtie = Path(Line(0, 10+10j), Line(10+10j, 10j), Line(10j, 10))
+        # points strictly inside the two triangular lobes, off the diagonals
+        top_lobe = 5+8j
+        bottom_lobe = 5+2j
+        for pt in (top_lobe, bottom_lobe):
+            self.assertEqual(point_in_path(pt, bowtie, 'nonzero'),
+                             POINT_INSIDE)
+            self.assertEqual(point_in_path(pt, bowtie, 'evenodd'),
+                             POINT_INSIDE)
+        # the self-intersection point itself is boundary
+        self.assertEqual(point_in_path(5+5j, bowtie), POINT_ON_BOUNDARY)
+        # outside the bowtie
+        self.assertEqual(point_in_path(-5+5j, bowtie), POINT_OUTSIDE)
+
+        # a point whose horizontal ray passes exactly through the crossing
+        # vertex must not be double counted under either rule
+        ray_pt = 2+5j
+        self.assertEqual(point_in_path(ray_pt, bowtie, 'nonzero'),
+                         POINT_OUTSIDE)
+        self.assertEqual(point_in_path(ray_pt, bowtie, 'evenodd'),
+                         POINT_OUTSIDE)
+
+    def test_ray_through_vertex_and_tangent(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE, POINT_ON_BOUNDARY)
+        square = self.square()
+        # ray from an outside point hits the corner (0, 0) head-on
+        self.assertEqual(point_in_path(-1+0j, square), POINT_OUTSIDE)
+        # ray level with the top edge but outside the square
+        self.assertEqual(point_in_path(-1+10j, square), POINT_OUTSIDE)
+        self.assertEqual(point_in_path(11+10j, square), POINT_OUTSIDE)
+        # just inside near the top edge
+        self.assertEqual(point_in_path(5+9.999j, square), POINT_INSIDE)
+
+        # circle built from two semicircular arcs; a ray tangent to the top
+        # of the circle must count zero crossings
+        upper = Arc(0, 5+5j, 0.0, False, True, 10)
+        lower = Arc(10, 5+5j, 0.0, False, True, 0)
+        circle = Path(upper, lower)
+        self.assertEqual(point_in_path(5+0j, circle), POINT_INSIDE)
+        self.assertEqual(point_in_path(20+5j, circle), POINT_OUTSIDE)
+        self.assertEqual(point_in_path(-5+5j, circle), POINT_OUTSIDE)
+        self.assertEqual(point_in_path(5+5j, circle), POINT_ON_BOUNDARY)
+
+    def test_bezier_and_arc_contours(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE, POINT_ON_BOUNDARY)
+        # closed contour made entirely of cubic beziers
+        path = Path(
+            CubicBezier(0+1j, 1j, 9+0j, 10+1j),
+            CubicBezier(10+1j, 10+9j, 9+10j, 1+10j),
+            CubicBezier(1+10j, 0+9j, 0+1j, 0+1j),
+        )
+        self.assertEqual(point_in_path(5+5j, path), POINT_INSIDE)
+        self.assertEqual(point_in_path(50+50j, path), POINT_OUTSIDE)
+        # a point sampled on the curve is boundary
+        boundary_pt = path[0].point(0.37)
+        self.assertEqual(point_in_path(boundary_pt, path),
+                         POINT_ON_BOUNDARY)
+
+        # quadratic bezier contour
+        quad_path = Path(
+            QuadraticBezier(0, 5-3j, 10),
+            QuadraticBezier(10, 5+13j, 0),
+        )
+        self.assertEqual(point_in_path(5+5j, quad_path), POINT_INSIDE)
+        self.assertEqual(point_in_path(5-5j, quad_path), POINT_OUTSIDE)
+
+        # rotated elliptical arc closed by a straight chord
+        arc = Arc(0, 6+3j, 30.0, True, True, 10+2j)
+        ellipse_path = Path(arc, Line(10+2j, 0))
+        self.assertEqual(point_in_path(50+50j, ellipse_path),
+                         POINT_OUTSIDE)
+        self.assertEqual(point_in_path(arc.point(0.37), ellipse_path),
+                         POINT_ON_BOUNDARY)
+
+    def test_open_subpath_implicitly_closed(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_OUTSIDE, POINT_ON_BOUNDARY)
+        open_path = Path(Line(0, 10), Line(10, 10+10j), Line(10+10j, 10j))
+        snapshot = [seg for seg in open_path]
+        self.assertEqual(point_in_path(5+5j, open_path), POINT_INSIDE)
+        self.assertEqual(point_in_path(-5+5j, open_path), POINT_OUTSIDE)
+        # point on the implicit closing edge (the x == 0 chord)
+        self.assertEqual(point_in_path(0+5j, open_path),
+                         POINT_ON_BOUNDARY)
+        # input must not be mutated or closed
+        self.assertEqual([seg for seg in open_path], snapshot)
+        self.assertNotEqual(open_path.start, open_path.end)
+
+    def test_boundary_tolerance_semantics(self):
+        from svgpathtools import (point_in_path, POINT_INSIDE,
+                                   POINT_ON_BOUNDARY)
+        path = self.square()
+        near_pt = 0.005 + 5j  # Euclidean distance 0.005 from the left edge
+        # default tolerance treats it as a normal interior point
+        self.assertEqual(point_in_path(near_pt, path), POINT_INSIDE)
+        # tolerance is an absolute distance in user-space coordinate units
+        self.assertEqual(point_in_path(near_pt, path, boundary_tol=0.01),
+                         POINT_ON_BOUNDARY)
+        self.assertEqual(point_in_path(near_pt, path, boundary_tol=0.001),
+                         POINT_INSIDE)
+        # zero tolerance still recognizes points lying exactly on the curve
+        self.assertEqual(point_in_path(0+5j, path, boundary_tol=0.0),
+                         POINT_ON_BOUNDARY)
+        self.assertEqual(point_in_path(near_pt, path, boundary_tol=0.0),
+                         POINT_INSIDE)
+
+    def test_agrees_with_path_encloses_pt(self):
+        from svgpathtools import path_encloses_pt, point_in_path, POINT_INSIDE
+        line1 = Line(0, 100+100j)
+        quadratic1 = QuadraticBezier(100+100j, 150+150j, 300+200j)
+        cubic1 = CubicBezier(300+200j, 350+400j, 400+425j, 650+325j)
+        line2 = Line(650+325j, 650+10j)
+        line3 = Line(650+10j, 0)
+        closed_bez_path = Path(line1, quadratic1, cubic1, line2, line3)
+
+        inside_pt = 200+20j
+        outside_pt1 = 1000+1000j
+        outside_pt2 = 800+800j
+        self.assertEqual(
+            point_in_path(inside_pt, closed_bez_path) == POINT_INSIDE,
+            path_encloses_pt(inside_pt, outside_pt2, closed_bez_path))
+        self.assertEqual(
+            point_in_path(outside_pt1, closed_bez_path) == POINT_INSIDE,
+            path_encloses_pt(outside_pt1, outside_pt2, closed_bez_path))
+
+
 class TestPathBugs(unittest.TestCase):
 
     def test_issue_113(self):

@@ -517,6 +517,342 @@ def path_encloses_pt(pt, opt, path):
         return False
 
 
+# Tri-state results returned by point_in_path().
+POINT_OUTSIDE = 0
+POINT_INSIDE = 1
+POINT_ON_BOUNDARY = 2
+
+# Fill rules understood by point_in_path().
+FILL_RULES = ('nonzero', 'evenodd')
+
+# Default boundary tolerance, in the same (user-space) units as the path
+# coordinates.  It is deliberately tiny so that exact boundary points are
+# still recognized despite floating-point round-off.
+DEFAULT_BOUNDARY_TOL = 1e-9
+# Hardest flatness (smallest deviation) the adaptive flattener is willing to
+# chase; subdividing further than this relative to the path scale only
+# accumulates round-off error.
+_MIN_FLATNESS_FRACTION = 1e-12
+
+
+def _point_to_line_distance(pt, start, end):
+    """Distance from `pt` to the finite line segment start--end."""
+    delta = end - start
+    norm2 = delta.real * delta.real + delta.imag * delta.imag
+    if norm2 == 0:
+        return abs(pt - start)
+    t = ((pt.real - start.real) * delta.real +
+         (pt.imag - start.imag) * delta.imag) / norm2
+    if t < 0.0:
+        t = 0.0
+    elif t > 1.0:
+        t = 1.0
+    return abs(pt - (start + t * delta))
+
+
+def _point_to_arc_distance(pt, arc, samples=48):
+    """Minimum distance from `pt` to an Arc segment.
+
+    The squared distance along an ellipse is a smooth periodic function of
+    the arc angle, so its minimum on the parameter interval is found by
+    dense sampling followed by golden-section refinement of the best
+    interval.  The refinement converges to about machine precision
+    regardless of the path's coordinate scale."""
+    n = int(max(4, samples))
+    best_t = 0.0
+    best_d2 = float('inf')
+    ts = np.linspace(0.0, 1.0, n + 1)
+    for k in range(n + 1):
+        d2 = abs(arc.point(ts[k]) - pt) ** 2
+        if d2 < best_d2:
+            best_d2 = d2
+            best_t = ts[k]
+    lo = ts[max(0, int(round(best_t * n)) - 1)]
+    hi = ts[min(n, int(round(best_t * n)) + 1)]
+
+    def d2_at(t):
+        z = arc.point(t)
+        return (z.real - pt.real) ** 2 + (z.imag - pt.imag) ** 2
+
+    gr = (sqrt(5.0) - 1.0) / 2.0
+    c = 1.0 - gr
+    x1 = lo + c * (hi - lo)
+    x2 = hi - c * (hi - lo)
+    f1 = d2_at(x1)
+    f2 = d2_at(x2)
+    for _ in range(60):
+        if hi - lo <= 1e-14 * max(1.0, abs(hi) + abs(lo)):
+            break
+        if f1 < f2:
+            hi = x2
+            x2 = x1
+            f2 = f1
+            x1 = lo + c * (hi - lo)
+            f1 = d2_at(x1)
+        else:
+            lo = x1
+            x1 = x2
+            f1 = f2
+            x2 = hi - c * (hi - lo)
+            f2 = d2_at(x2)
+    t_best = 0.5 * (lo + hi)
+    best_d2 = min(best_d2, d2_at(t_best), d2_at(lo), d2_at(hi))
+    return sqrt(max(0.0, best_d2))
+
+
+def _point_to_segment_distance(pt, seg, cutoff=None):
+    """Minimum Euclidean distance from `pt` to a path segment.
+
+    If `cutoff` is given and the segment's bounding box is already farther
+    away than `cutoff`, the bounding-box lower bound is returned without
+    solving the segment's stationary-point polynomial.  Such a return is only
+    a lower bound, which is sufficient for minimum-distance scans."""
+    if isinstance(seg, Arc):
+        return _point_to_arc_distance(pt, seg)
+    if isinstance(seg, Line):
+        return _point_to_line_distance(pt, seg.start, seg.end)
+    xmin, xmax, ymin, ymax = seg.bbox()
+    # The segment can't get closer than the distance from the point to its
+    # (tight) bounding box; prune segments that cannot beat the best so far.
+    dx = max(xmin - pt.real, 0.0, pt.real - xmax)
+    dy = max(ymin - pt.imag, 0.0, pt.imag - ymax)
+    bbox_distance = sqrt(dx * dx + dy * dy)
+    if cutoff is not None and bbox_distance >= cutoff:
+        return bbox_distance
+    # Bezier segments solve their stationary-point polynomial exactly.
+    shifted = seg.poly() - pt
+    r_squared = real(shifted) ** 2 + imag(shifted) ** 2
+    candidates = [0.0, 1.0] + [t for t in polyroots01(r_squared.deriv())
+                              if np.isreal(t)]
+    return min(abs(seg.point(t) - pt) for t in candidates)
+
+
+def _arc_sagitta(arc):
+    """Maximum distance of the arc from its endpoint chord (the sagitta)."""
+    midpoint = arc.point(0.5)
+    return _point_to_line_distance(midpoint, arc.start, arc.end)
+
+
+def _flatten_segment(seg, flatness, min_flatness, max_depth):
+    """Adaptive midpoint subdivision returning polygon vertices.
+
+    For every emitted chord the true curve stays within `flatness` of the
+    chord (Bezier convex-hull bound; arc sagitta bound), so the resulting
+    polygon is a Hausdorff approximation of the segment.  Bezier subdivision
+    works directly on control-point tuples via de Casteljau's algorithm to
+    avoid constructing thousands of intermediate segment objects."""
+    if isinstance(seg, Line):
+        return [seg.start, seg.end]
+    limit = max(flatness, min_flatness)
+    if isinstance(seg, Arc):
+        # Arcs keep using their exact parameterization; subdivision depth is
+        # bounded so this stays cheap.
+        stack = [(seg, 0)]
+        vertices = []
+        while stack:
+            current, depth = stack.pop()
+            if _arc_sagitta(current) <= limit or depth >= max_depth:
+                if vertices:
+                    vertices.append(current.end)
+                else:
+                    vertices.extend([current.start, current.end])
+            else:
+                first, second = current.split(0.5)
+                stack.append((second, depth + 1))
+                stack.append((first, depth + 1))
+        return vertices
+
+    def flat(points):
+        p0, pn = points[0], points[-1]
+        worst = 0.0
+        for p in points[1:-1]:
+            d = _point_to_line_distance(p, p0, pn)
+            if d > worst:
+                worst = d
+        return worst
+
+    def halve(points):
+        # de Casteljau at t = 1/2 on the control polygon.
+        left = [points[0]]
+        right = [points[-1]]
+        current = points
+        while len(current) > 1:
+            nxt = []
+            for a, b in zip(current[:-1], current[1:]):
+                midpoint = 0.5 * (a + b)
+                nxt.append(midpoint)
+            left.append(nxt[0])
+            right.append(nxt[-1])
+            current = nxt
+        right.reverse()
+        return left, right
+
+    stack = [(seg.bpoints(), 0)]
+    vertices = []
+    while stack:
+        points, depth = stack.pop()
+        if flat(points) <= limit or depth >= max_depth:
+            if vertices:
+                vertices.append(points[-1])
+            else:
+                vertices.extend([points[0], points[-1]])
+        else:
+            left, right = halve(points)
+            stack.append((right, depth + 1))
+            stack.append((left, depth + 1))
+    return vertices
+
+
+def _polygon_winding_number(vertices, pt):
+    """Winding number of a closed polygon (list of vertices) about `pt`.
+
+    Uses the half-open horizontal-ray rule: an edge is counted only when it
+    crosses the ray y == pt.imag with x > pt.real, and each vertex level is
+    owned by the edge leaving it.  A ray passing exactly through a vertex or
+    tangent to the outline therefore contributes either one crossing or zero
+    (two cancelling crossings), never two."""
+    px = pt.real
+    py = pt.imag
+    winding = 0
+    v0 = vertices[-1]
+    y0 = v0.imag
+    for v1 in vertices:
+        y1 = v1.imag
+        if y0 <= py:
+            if y1 > py:
+                # upward crossing of the ray
+                x_cross = v0.real + (py - y0) * (v1.real - v0.real) / (y1 - y0)
+                if x_cross > px:
+                    winding += 1
+        elif y1 <= py:
+            # downward crossing of the ray
+            x_cross = v0.real + (py - y0) * (v1.real - v0.real) / (y1 - y0)
+            if x_cross > px:
+                winding -= 1
+        v0 = v1
+        y0 = y1
+    return winding
+
+
+def point_in_path(pt, path, fill_rule='nonzero',
+                  boundary_tol=DEFAULT_BOUNDARY_TOL):
+    """Hit-test `pt` against the filled region of `path`.
+
+    Unlike :func:`path_encloses_pt`, this needs no caller-supplied exterior
+    point, so it works directly for editor-style hit testing of icons with
+    holes and multiple contours.
+
+    Parameters
+    ----------
+    pt : complex
+        The point being tested, expressed as a complex coordinate
+        ``x + y*1j``.
+    path : Path
+        The path whose fill region is tested.  It may contain any number of
+        continuous subpaths made of :class:`Line`,
+        :class:`QuadraticBezier`, :class:`CubicBezier` and :class:`Arc`
+        segments.  The path is never modified: open subpaths are treated as
+        implicitly closed by a straight segment from their last point back
+        to their first, following the SVG fill semantics.
+    fill_rule : str
+        Either ``'nonzero'`` (the SVG default) or ``'evenodd'``.  With the
+        nonzero rule the signed crossings are summed, so contour direction
+        and nesting matter (a reverse-oriented inner contour cuts a hole);
+        with the evenodd rule only the parity of the number of enclosing
+        contours matters.  Self-intersecting contours are handled correctly
+        under either rule.
+    boundary_tol : float
+        Non-negative distance, in the path's user-space units, within which
+        `pt` is considered to lie on the boundary.  A point whose Euclidean
+        distance to any segment (including the implicit closing segment of
+        an open subpath) is at most `boundary_tol` is reported as
+        :data:`POINT_ON_BOUNDARY`, regardless of the fill rule.  Use ``0.0``
+        to require an exact hit (up to floating-point round-off).  Note this
+        is an absolute distance in coordinate units, not a relative
+        tolerance, and does not grow when the path is scaled up.
+
+    Returns
+    -------
+    int
+        :data:`POINT_INSIDE` (1) if `pt` lies in the filled region,
+        :data:`POINT_OUTSIDE` (0) if it does not, or
+        :data:`POINT_ON_BOUNDARY` (2) if it is within `boundary_tol` of the
+        path outline.
+
+    Notes
+    -----
+    The test first measures the true distance from the point to the outline
+    (exact for lines and Bezier curves, a converged numerical minimum for
+    arcs) to settle the boundary case.  Non-boundary points are classified
+    by adaptively flattening every segment to a flatness strictly smaller
+    than that distance and applying the half-open winding-number rule, so
+    rays passing through vertices or tangent to a curve are never counted
+    twice.
+    """
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path object.")
+    if fill_rule not in FILL_RULES:
+        raise ValueError(
+            "fill_rule must be one of {}; got {!r}.".format(FILL_RULES,
+                                                            fill_rule))
+    if boundary_tol < 0:
+        raise ValueError("boundary_tol must be non-negative.")
+    if len(path) == 0:
+        return POINT_OUTSIDE
+
+    # Fast rejection: anything outside the overall bounding box (expanded by
+    # the boundary tolerance) cannot be inside or on the outline.
+    xmin, xmax, ymin, ymax = path.bbox()
+    if not (xmin - boundary_tol <= pt.real <= xmax + boundary_tol and
+            ymin - boundary_tol <= pt.imag <= ymax + boundary_tol):
+        return POINT_OUTSIDE
+
+    subpaths = path.continuous_subpaths()
+
+    # Boundary check against the true curves, including the straight segment
+    # that SVG fill adds to close open subpaths.
+    min_distance = float('inf')
+    for subpath in subpaths:
+        for seg in subpath:
+            d = _point_to_segment_distance(pt, seg, cutoff=min_distance)
+            if d < min_distance:
+                min_distance = d
+        if subpath.start != subpath.end:
+            d = _point_to_line_distance(pt, subpath.end, subpath.start)
+            if d < min_distance:
+                min_distance = d
+    if min_distance <= boundary_tol:
+        return POINT_ON_BOUNDARY
+
+    # The flattener must deviate from the true outline by less than the
+    # point-outline separation, otherwise it could move the ray across the
+    # point.  Scale the floor with the path's coordinate magnitude to keep
+    # subdivision meaningful for large coordinates.
+    path_scale = max(1.0, max(abs(v) for v in path.bbox()))
+    min_flatness = _MIN_FLATNESS_FRACTION * path_scale
+    flatness = max(0.25 * min_distance, min_flatness)
+    max_depth = 64
+
+    winding = 0
+    for subpath in subpaths:
+        vertices = []
+        for seg in subpath:
+            piece = _flatten_segment(seg, flatness, min_flatness, max_depth)
+            if vertices:
+                vertices.extend(piece[1:])
+            else:
+                vertices.extend(piece)
+        # SVG fill implicitly closes open subpaths; no input object is
+        # mutated, the closing chord only exists in this local polygon.
+        if vertices[0] != vertices[-1]:
+            vertices.append(vertices[0])
+        winding += _polygon_winding_number(vertices, pt)
+
+    if fill_rule == 'evenodd':
+        return POINT_INSIDE if winding % 2 != 0 else POINT_OUTSIDE
+    return POINT_INSIDE if winding != 0 else POINT_OUTSIDE
+
+
 def segment_length(curve, start, end, start_point, end_point,
                    error=LENGTH_ERROR, min_depth=LENGTH_MIN_DEPTH, depth=0):
     """Recursively approximates the length by straight lines"""
