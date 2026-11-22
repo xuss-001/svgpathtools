@@ -30,7 +30,38 @@ Some included tools:
 - compute **area** enclosed by a closed path
 - compute **arc length**
 - compute **inverse arc length**
+- **morph** between two closed outlines (see *Morphing closed outlines* below)
 - convert RGB color tuples to hexadecimal color strings and back
+
+## Morphing closed outlines
+
+`morph_closed_paths(path1, path2, t, num_samples=100)` interpolates between
+two single, continuous, non-self-intersecting closed `Path` objects (with
+any mixture of `Line`, `QuadraticBezier`, `CubicBezier` and `Arc` segments)
+and returns the intermediate outline as a `Path` that can be serialized
+with `d()` or `wsvg()`.  `t` must lie in `[0, 1]`; `t == 0` and `t == 1`
+return the exact original geometry of `path1` and `path2` respectively.
+Out-of-range progress or unsupported input raises a `TypeError` or
+`ValueError`.
+
+The point correspondences used for the interpolation follow these
+**alignment rules** (see the `svgpathtools/morph.py` docstring for details):
+
+1. **Uniform arc-length sampling** — each outline is sampled at
+   `num_samples` points equally spaced by arc length, so the result does
+   not depend on how the outlines are segmented.
+2. **Orientation normalization** — if the outlines wind in opposite
+   directions, the second sample sequence is reversed so the morph does
+   not collapse through the interior.
+3. **Start-point (phase) alignment** — a cyclic shift minimizing the total
+   squared distance between corresponding samples is chosen (via FFT
+   cross-correlation), so moving an outline's start point does not cause
+   spurious rotation or collapse.
+4. **Linear interpolation** — corresponding samples are interpolated
+   linearly; intermediate frames are closed polygons of `num_samples`
+   `Line` segments.
+5. **Endpoint fidelity** — at `t == 0` and `t == 1` the original paths are
+   returned unchanged, preserving all curve and arc geometry.
 
 ## Prerequisites
 - **numpy**
