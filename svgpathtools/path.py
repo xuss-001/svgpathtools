@@ -148,6 +148,156 @@ def concatpaths(list_of_paths):
     return Path(*[seg for path in list_of_paths for seg in path])
 
 
+def _validate_dash_array(dash_array):
+    """Validates and normalizes a dash pattern.
+
+    Returns the pattern as a list of floats of even length (patterns with
+    an odd number of entries are repeated once, as per the SVG
+    'stroke-dasharray' specification).
+    """
+    try:
+        dashes = [float(d) for d in dash_array]
+    except TypeError:
+        raise ValueError("dash_array must be a sequence of numbers, got "
+                         "{!r}.".format(dash_array))
+    if len(dashes) == 0:
+        raise ValueError("dash_array must contain at least one value.")
+    if any(d < 0 for d in dashes):
+        raise ValueError("dash_array values must be non-negative, got "
+                         "{!r}.".format(dash_array))
+    if all(d == 0 for d in dashes):
+        raise ValueError("dash_array values must not all be zero.")
+    if len(dashes) % 2 == 1:
+        dashes = dashes * 2
+    return dashes
+
+
+def _visible_intervals(dashes, offset, length):
+    """Computes the arclength intervals of [0, length] covered by the "on"
+    parts (even indices) of the dash pattern `dashes`, where `offset` is the
+    distance into the dash pattern at which the path starts (any real
+    number; it is reduced modulo the pattern's period)."""
+    period = sum(dashes)
+    pos = offset % period
+    # Locate the pattern element containing pos.
+    idx = 0
+    while pos >= dashes[idx]:
+        pos -= dashes[idx]
+        idx += 1
+    intervals = []
+    s = 0.0
+    n = len(dashes)
+    while s < length:
+        remaining = dashes[idx] - pos
+        if remaining <= 0:
+            # Zero-length pattern element; skip it without consuming
+            # arclength.  This terminates as the period is positive.
+            idx = (idx + 1) % n
+            pos = 0.0
+            continue
+        nxt = min(s + remaining, length)
+        if idx % 2 == 0:
+            intervals.append((s, nxt))
+        s = nxt
+        idx = (idx + 1) % n
+        pos = 0.0
+    # Merge adjacent intervals (can arise from zero-length gaps).
+    merged = []
+    for a, b in intervals:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], b)
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def _cropped_by_arclength(subpath, seg_lengths, seg_starts, a, b):
+    """Returns the list of segments (cropped copies of those in `subpath`,
+    except where a segment is used in full) covering the arclength interval
+    [a, b] of `subpath`.  `seg_lengths` and `seg_starts` are the segment
+    lengths and their cumulative arclength offsets."""
+    segments = []
+    for seg, slen, s0 in zip(subpath, seg_lengths, seg_starts):
+        s1 = s0 + slen
+        if s1 <= a or s0 >= b:
+            continue
+        lo = max(a - s0, 0.0)
+        hi = min(b - s0, slen)
+        if hi <= lo:
+            continue
+        t0 = 0.0 if lo <= 0.0 else seg.ilength(lo)
+        t1 = 1.0 if hi >= slen else seg.ilength(hi)
+        if t0 == 0.0 and t1 == 1.0:
+            segments.append(seg)
+        else:
+            cropped = seg.cropped(t0, t1)
+            # Snap to the original endpoints where the segment is not cut,
+            # so that adjoining pieces join exactly (seg.point(0) and
+            # seg.point(1) need not equal seg.start and seg.end exactly).
+            if t0 == 0.0:
+                cropped.start = seg.start
+            if t1 == 1.0:
+                cropped.end = seg.end
+            segments.append(cropped)
+    return segments
+
+
+def dashed_path(path, dash_array, offset=0):
+    """Expands a dashed stroke into the list of its visible Path pieces.
+
+    Args:
+        path: a Path object (or a single path segment) to be dashed.
+        dash_array: a sequence of alternating dash ("on") and gap ("off")
+            lengths, like the SVG 'stroke-dasharray' attribute.  A sequence
+            with an odd number of entries is repeated once so that it has
+            an even number of entries.  Individual entries may be zero, but
+            negative entries and all-zero (or empty) sequences raise a
+            ValueError.
+        offset: the distance into the dash pattern at which to start, like
+            the SVG 'stroke-dashoffset' attribute.  May be any real number;
+            it is reduced modulo the pattern's period.
+
+    Returns:
+        A list of Path objects, one per visible dash.  Each returned Path
+        is continuous and made of segments of the same types (Line,
+        QuadraticBezier, CubicBezier, Arc) and orientation as the
+        corresponding parts of `path`, which is left unmodified.  The dash
+        pattern is restarted (including `offset`) for every discontinuous
+        subpath of `path`.  If a subpath is closed and a single dash
+        crosses its start/end point, the corresponding pieces are joined
+        into one Path.
+    """
+    if is_path_segment(path):
+        path = Path(path)
+    dashes = _validate_dash_array(dash_array)
+    visible = []
+    for subpath in path.continuous_subpaths():
+        if len(subpath) == 0:
+            continue
+        seg_lengths = [seg.length() for seg in subpath]
+        seg_starts = [0.0]
+        for slen in seg_lengths[:-1]:
+            seg_starts.append(seg_starts[-1] + slen)
+        length = seg_starts[-1] + seg_lengths[-1]
+        if length == 0:
+            continue
+        intervals = _visible_intervals(dashes, offset, length)
+        runs = []
+        for a, b in intervals:
+            segments = _cropped_by_arclength(subpath, seg_lengths,
+                                             seg_starts, a, b)
+            if segments:
+                runs.append((a, b, Path(*segments)))
+        # Join the first and last dashes if a single dash crosses the
+        # start/end point of a closed subpath.
+        if (len(runs) > 1 and subpath.isclosed()
+                and runs[0][0] == 0.0 and runs[-1][1] == length):
+            joined = Path(*(list(runs[-1][2]) + list(runs[0][2])))
+            runs = [(runs[-1][0], runs[0][1], joined)] + runs[1:-1]
+        visible.extend(run for _, _, run in runs)
+    return visible
+
+
 def bbox2path(xmin, xmax, ymin, ymax):
     """Converts a bounding box 4-tuple to a Path object."""
     b = Line(xmin + 1j*ymin, xmax + 1j*ymin)
@@ -3132,6 +3282,11 @@ class Path(MutableSequence):
             if t_seg1 != 0:
                 new_path.append(seg1.cropped(0, t_seg1))
         return new_path
+
+    def dashed(self, dash_array, offset=0):
+        """Expands a dashed stroke into the list of its visible Path
+        pieces.  See the dashed_path() docstring for more details."""
+        return dashed_path(self, dash_array, offset=offset)
 
     def radialrange(self, origin, return_all_global_extrema=False):
         """returns the tuples (d_min, t_min, idx_min), (d_max, t_max, idx_max)
