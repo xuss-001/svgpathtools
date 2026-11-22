@@ -25,6 +25,7 @@ Some included tools:
 - find a **bounding box** for a path or segment
 - **reverse** segment/path orientation
 - **crop** and **split** paths and segments
+- **flatten** curves to tolerance-bounded polylines (with an affine transform)
 - **smooth** paths (i.e. smooth away kinks to make paths differentiable)
 - **transition maps** from path domain to segment domain and back (T2t and t2T)
 - compute **area** enclosed by a closed path
@@ -211,6 +212,38 @@ wsvg(paths, attributes=attributes, svg_attributes=svg_attributes, filename='outp
 ![output1.svg](output1.svg)
 
 There will be many more examples of writing and displaying path data below.
+
+### Flattening paths to polylines
+
+`flatten_path()` converts `Line`, `QuadraticBezier`, `CubicBezier`, and `Arc`
+segments to polylines.  The tolerance is measured in the final coordinates
+after the optional affine transform.  The returned value contains one vertex
+list per continuous subpath; disconnected subpaths are not joined, and closed
+subpaths have the same first and last vertex.
+
+The error bound is certified while subdividing the curves, rather than by
+checking a few sample points.  If the requested tolerance cannot be reached
+within `max_depth` or `max_segments`, a `FlatteningLimitError` is raised.
+
+```python
+from svgpathtools import flatten_path, parse_path
+
+path = parse_path(
+    'M 0 0 L 10 0 Q 20 10 30 0 C 40 -10 50 10 60 0 '
+    'M 80 0 A 20 10 25 1 1 100 0'
+)
+
+# SVG matrix(a, b, c, d, e, f): x' = a*x + c*y + e, y' = b*x + d*y + f
+transform = (1000, 0, 0, 0.01, 5, -5)
+
+polylines = flatten_path(
+    path, tolerance=1e-3, transform=transform,
+    max_depth=32, max_segments=1000000
+)
+for vertices in polylines:
+    print(len(vertices), vertices[0], vertices[-1],
+          vertices[0] == vertices[-1])
+```
 
 ### The .point() method and transitioning between path and path segment parameterizations
 SVG Path elements and their segments have official parameterizations.

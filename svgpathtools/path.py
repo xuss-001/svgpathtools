@@ -11,6 +11,7 @@ except ImportError:
     from collections import MutableSequence  # noqa
 from warnings import warn
 from operator import itemgetter
+from numbers import Real
 import numpy as np
 from itertools import tee
 from functools import reduce
@@ -170,6 +171,357 @@ def polygon(*points):
     See also `polyline()`."""
     return Path(*[Line(points[i], points[(i + 1) % len(points)])
                   for i in range(len(points))])
+
+
+# Polyline approximation ######################################################
+
+DEFAULT_FLATTEN_TOLERANCE = 0.25
+DEFAULT_FLATTEN_MAX_DEPTH = 32
+DEFAULT_FLATTEN_MAX_SEGMENTS = 1000000
+
+
+class FlatteningError(RuntimeError):
+    """Base class for errors raised while flattening curves to polylines."""
+
+
+class FlatteningLimitError(FlatteningError):
+    """Raised when the flattening resource limits are exhausted."""
+
+
+class _FlattenState:
+    """Tracks the shared output budget while flattening all subpaths."""
+
+    def __init__(self, tolerance, max_depth, max_segments):
+        self.tolerance = tolerance
+        self.max_depth = max_depth
+        self.max_segments = max_segments
+        self.segments = 0
+
+    def add_segment(self, depth, error_bound):
+        if self.segments >= self.max_segments:
+            self.fail('max_segments', depth, error_bound)
+        self.segments += 1
+
+    def fail(self, resource, depth, error_bound):
+        raise FlatteningLimitError(
+            "Could not flatten within tolerance {!r}: {} exhausted at "
+            "subdivision depth {} while the remaining curve-to-chord "
+            "deviation is bounded by {:.12g}. Increase max_depth or "
+            "max_segments, or relax the tolerance.".format(
+                self.tolerance, resource, depth, error_bound))
+
+
+def _resolve_tolerance(tolerance, error, tol, max_error):
+    aliases = [value for value in (error, tol, max_error)
+               if value is not None]
+    if tolerance is None:
+        if len(aliases) > 1:
+            raise TypeError(
+                "Specify only one of `error`, `tol`, and `max_error`.")
+        tolerance = aliases[0] if aliases else DEFAULT_FLATTEN_TOLERANCE
+    elif aliases:
+        raise TypeError(
+            "Specify tolerance with either `tolerance`, `error`, `tol`, or "
+            "`max_error`, not more than one.")
+
+    if (isinstance(tolerance, (bool, np.bool_)) or
+            not isinstance(tolerance, Real)):
+        raise TypeError("tolerance must be a finite positive number.")
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0:
+        raise ValueError("tolerance must be a finite positive number.")
+    return tolerance
+
+
+def _resolve_resource_limit(value, name, minimum):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)):
+        raise TypeError("{} must be an integer.".format(name))
+    if value < minimum:
+        if minimum == 0:
+            raise ValueError("{} must be non-negative.".format(name))
+        raise ValueError("{} must be positive.".format(name))
+    return int(value)
+
+
+def _normalize_affine_transform(transform):
+    """Return an affine transform as a 2x3 float array."""
+    if transform is None:
+        return np.array([[1.0, 0.0, 0.0],
+                         [0.0, 1.0, 0.0]])
+
+    try:
+        matrix = np.asarray(transform, dtype=float)
+    except (TypeError, ValueError):
+        raise TypeError(
+            "transform must be a 2x3, 3x3, 2x2, or SVG 6-value affine "
+            "matrix.")
+
+    if matrix.shape == (2, 3):
+        affine = matrix
+    elif matrix.shape == (3, 3):
+        if not np.allclose(matrix[2], [0.0, 0.0, 1.0],
+                           rtol=0.0, atol=1e-12):
+            raise ValueError(
+                "transform must be affine (its homogeneous bottom row must "
+                "be [0, 0, 1]).")
+        affine = matrix[:2, :]
+    elif matrix.shape == (2, 2):
+        affine = np.column_stack((matrix, [0.0, 0.0]))
+    elif matrix.shape == (6,):
+        affine = np.array([[matrix[0], matrix[2], matrix[4]],
+                           [matrix[1], matrix[3], matrix[5]]])
+    else:
+        raise ValueError(
+            "transform must be a 2x3, 3x3, 2x2, or SVG 6-value affine "
+            "matrix.")
+
+    if not np.all(np.isfinite(affine)):
+        raise ValueError("transform must contain only finite values.")
+    return np.asarray(affine, dtype=float)
+
+
+def _apply_affine(point, matrix):
+    x, y = point.real, point.imag
+    transformed = complex(
+        matrix[0, 0]*x + matrix[0, 1]*y + matrix[0, 2],
+        matrix[1, 0]*x + matrix[1, 1]*y + matrix[1, 2])
+    if not (np.isfinite(transformed.real) and
+            np.isfinite(transformed.imag)):
+        raise FlatteningError(
+            "An affine transform produced a non-finite coordinate.")
+    return transformed
+
+
+def _point_segment_distance(point, start, end):
+    """Return the Euclidean distance from `point` to segment [start, end]."""
+    direction = end - start
+    length_squared = direction.real**2 + direction.imag**2
+    if length_squared == 0:
+        return abs(point - start)
+    offset = point - start
+    t = (offset.real*direction.real +
+         offset.imag*direction.imag) / length_squared
+    t = min(1.0, max(0.0, t))
+    closest = start + t*direction
+    return abs(point - closest)
+
+
+def _bezier_chord_error_bound(control_points):
+    """Bound the distance from a Bezier curve to its endpoint chord.
+
+    A Bezier curve lies in the convex hull of its control points.  Distance
+    to a line segment is a convex function, so the maximum distance from the
+    curve to the chord is bounded by the maximum distance of a control point
+    to that chord.
+    """
+    start, end = control_points[0], control_points[-1]
+    return max((_point_segment_distance(point, start, end)
+                for point in control_points[1:-1]), default=0.0)
+
+
+def _flatten_bezier_controls(control_points, state):
+    """Flatten transformed Bezier control points with a certified bound."""
+    points = [control_points[0]]
+    stack = [(control_points, 0)]
+
+    while stack:
+        current, depth = stack.pop()
+        error_bound = _bezier_chord_error_bound(current)
+        if error_bound <= state.tolerance:
+            state.add_segment(depth, error_bound)
+            points.append(current[-1])
+            continue
+        if depth >= state.max_depth:
+            state.fail('max_depth', depth, error_bound)
+
+        left, right = split_bezier(current, 0.5)
+        stack.append((right, depth + 1))
+        stack.append((left, depth + 1))
+
+    return points
+
+
+def _arc_affine_second_derivative_bound(segment, matrix):
+    """Bound the norm of the transformed Arc's second derivative."""
+    delta = radians(abs(segment.delta))
+    if delta == 0:
+        return 0.0
+
+    cos_phi = abs(cos(segment.phi))
+    sin_phi = abs(sin(segment.phi))
+    rx = segment.radius.real
+    ry = segment.radius.imag
+
+    # Both components of the ellipse's second derivative are bounded by
+    # delta**2 times these axis-aligned envelopes.
+    ellipse_x_bound = rx*cos_phi + ry*sin_phi
+    ellipse_y_bound = rx*sin_phi + ry*cos_phi
+
+    x_second_bound = delta**2 * (
+        abs(matrix[0, 0])*ellipse_x_bound +
+        abs(matrix[0, 1])*ellipse_y_bound)
+    y_second_bound = delta**2 * (
+        abs(matrix[1, 0])*ellipse_x_bound +
+        abs(matrix[1, 1])*ellipse_y_bound)
+    return float(np.hypot(x_second_bound, y_second_bound))
+
+
+def _flatten_arc(segment, matrix, state):
+    """Flatten an Arc using a second-derivative interpolation bound."""
+    start = _apply_affine(segment.start, matrix)
+    end = _apply_affine(segment.end, matrix)
+    second_derivative_bound = _arc_affine_second_derivative_bound(
+        segment, matrix)
+    if not np.isfinite(second_derivative_bound):
+        raise FlatteningError(
+            "Unable to bound the transformed Arc's approximation error.")
+
+    def point_at(t):
+        if t == 0:
+            return start
+        if t == 1:
+            return end
+        return _apply_affine(segment.point(t), matrix)
+
+    points = [start]
+    stack = [(0.0, 1.0, 0)]
+    while stack:
+        t0, t1, depth = stack.pop()
+        interval = t1 - t0
+        error_bound = (interval*interval/8.0)*second_derivative_bound
+        if error_bound <= state.tolerance:
+            state.add_segment(depth, error_bound)
+            points.append(point_at(t1))
+            continue
+        if depth >= state.max_depth:
+            state.fail('max_depth', depth, error_bound)
+
+        midpoint = (t0 + t1)/2.0
+        if midpoint == t0 or midpoint == t1:
+            state.fail('floating-point precision', depth, error_bound)
+        stack.append((midpoint, t1, depth + 1))
+        stack.append((t0, midpoint, depth + 1))
+
+    return points
+
+
+def _flatten_segment_to_points(segment, matrix, state):
+    if is_bezier_segment(segment):
+        control_points = [_apply_affine(point, matrix)
+                          for point in segment.bpoints()]
+        return _flatten_bezier_controls(control_points, state)
+    if isinstance(segment, Arc):
+        return _flatten_arc(segment, matrix, state)
+    raise TypeError(
+        "Can only flatten Line, QuadraticBezier, CubicBezier, and Arc "
+        "segments.")
+
+
+def _continuous_segment_groups(segments):
+    if not segments:
+        return []
+    groups = []
+    current = [segments[0]]
+    for previous, segment in zip(segments, segments[1:]):
+        if previous.end != segment.start:
+            groups.append(current)
+            current = [segment]
+        else:
+            current.append(segment)
+    groups.append(current)
+    return groups
+
+
+def flatten_path(path, tolerance=None, transform=None,
+                 max_depth=DEFAULT_FLATTEN_MAX_DEPTH,
+                 max_segments=DEFAULT_FLATTEN_MAX_SEGMENTS,
+                 *, error=None, tol=None, max_error=None):
+    """Convert a Path to tolerance-bounded polyline vertex sequences.
+
+    Parameters
+    ----------
+    path : Path or path segment
+        The geometry to flatten.  Line, QuadraticBezier, CubicBezier, and Arc
+        segments are supported.
+    tolerance : float
+        Maximum allowed distance, measured in transformed coordinates, from
+        any point on the source curve to the output polyline.  The bound is
+        certified by the optimization bounds used during subdivision; it is
+        not based on checking only a finite list of sample points.
+    transform : array-like, optional
+        A 2D affine transform as a 3x3 homogeneous matrix, 2x3 matrix, 2x2
+        linear matrix, or SVG's six-value ``(a, b, c, d, e, f)`` form.
+    max_depth : int
+        Maximum number of recursive bisections per input segment.
+    max_segments : int
+        Maximum total number of output polyline segments.
+
+    Returns
+    -------
+    list[list[complex]]
+        One vertex list for each continuous input subpath.  Ordering and
+        endpoints are preserved.  Discontinuous parts remain separate, and a
+        closed subpath has identical first and last vertices.
+
+    Raises
+    ------
+    ValueError
+        If `tolerance` is not finite and positive, or if the transform is not
+        a finite 2D affine transform.
+    FlatteningLimitError
+        If `max_depth` or `max_segments` is exhausted before the requested
+        tolerance can be certified.
+    """
+    tolerance = _resolve_tolerance(tolerance, error, tol, max_error)
+    matrix = _normalize_affine_transform(transform)
+    max_depth = _resolve_resource_limit(max_depth, 'max_depth', 0)
+    max_segments = _resolve_resource_limit(
+        max_segments, 'max_segments', 0)
+
+    if isinstance(path, Path):
+        segments = list(path)
+    elif is_path_segment(path):
+        segments = [path]
+    else:
+        raise TypeError(
+            "path must be a Path, Line, QuadraticBezier, CubicBezier, or "
+            "Arc object.")
+
+    state = _FlattenState(tolerance, max_depth, max_segments)
+    polylines = []
+    for group in _continuous_segment_groups(segments):
+        vertices = []
+        for segment in group:
+            segment_vertices = _flatten_segment_to_points(
+                segment, matrix, state)
+            if vertices:
+                vertices.extend(segment_vertices[1:])
+            else:
+                vertices.extend(segment_vertices)
+        polylines.append(vertices)
+    return polylines
+
+
+def flatten_segment(segment, tolerance=None, transform=None,
+                    max_depth=DEFAULT_FLATTEN_MAX_DEPTH,
+                    max_segments=DEFAULT_FLATTEN_MAX_SEGMENTS,
+                    *, error=None, tol=None, max_error=None):
+    """Flatten one path segment, returning its vertex sequence."""
+    if not is_path_segment(segment):
+        raise TypeError(
+            "segment must be a Line, QuadraticBezier, CubicBezier, or Arc.")
+    return flatten_path(
+        Path(segment), tolerance=tolerance, transform=transform,
+        max_depth=max_depth, max_segments=max_segments, error=error, tol=tol,
+        max_error=max_error)[0]
+
+
+path_to_polyline = flatten_path
+path_to_polylines = flatten_path
+flatten = flatten_path
+segment_to_polyline = flatten_segment
+PolylineFlatteningError = FlatteningError
 
 
 # Conversion###################################################################
@@ -2688,6 +3040,40 @@ class Path(MutableSequence):
     def isclosedac(self):
         assert len(self) != 0
         return self.start == self.end
+
+    def flatten(self, tolerance=None, transform=None,
+                max_depth=DEFAULT_FLATTEN_MAX_DEPTH,
+                max_segments=DEFAULT_FLATTEN_MAX_SEGMENTS,
+                *, error=None, tol=None, max_error=None):
+        """Return tolerance-bounded polylines, one per continuous subpath.
+
+        See `flatten_path` for the tolerance, transform, return-value, and
+        resource-limit semantics.
+        """
+        return flatten_path(
+            self, tolerance=tolerance, transform=transform,
+            max_depth=max_depth, max_segments=max_segments,
+            error=error, tol=tol, max_error=max_error)
+
+    def to_polyline(self, tolerance=None, transform=None,
+                    max_depth=DEFAULT_FLATTEN_MAX_DEPTH,
+                    max_segments=DEFAULT_FLATTEN_MAX_SEGMENTS,
+                    *, error=None, tol=None, max_error=None):
+        """Alias for `Path.flatten`."""
+        return self.flatten(
+            tolerance=tolerance, transform=transform, max_depth=max_depth,
+            max_segments=max_segments, error=error, tol=tol,
+            max_error=max_error)
+
+    def to_polylines(self, tolerance=None, transform=None,
+                     max_depth=DEFAULT_FLATTEN_MAX_DEPTH,
+                     max_segments=DEFAULT_FLATTEN_MAX_SEGMENTS,
+                     *, error=None, tol=None, max_error=None):
+        """Alias for `Path.flatten`."""
+        return self.flatten(
+            tolerance=tolerance, transform=transform, max_depth=max_depth,
+            max_segments=max_segments, error=error, tol=tol,
+            max_error=max_error)
 
     def _is_closable(self):
         try:
