@@ -3133,6 +3133,14 @@ class Path(MutableSequence):
                 new_path.append(seg1.cropped(0, t_seg1))
         return new_path
 
+    def dashed(self, dashes, offset=0.0):
+        """Returns the list of visible Paths produced by stroking this path
+        with the dash pattern `dashes` (alternating dash/gap lengths) and
+        dash offset `offset`.  See svgpathtools.dash.dashed_path for
+        details."""
+        from .dash import dashed_path
+        return dashed_path(self, dashes, offset=offset)
+
     def radialrange(self, origin, return_all_global_extrema=False):
         """returns the tuples (d_min, t_min, idx_min), (d_max, t_max, idx_max)
         which minimize and maximize, respectively, the distance
