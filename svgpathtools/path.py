@@ -742,6 +742,10 @@ class Line(object):
         """returns a copy of the Line object with its orientation reversed."""
         return Line(self.end, self.start)
 
+    def self_intersections(self, tol=1e-9):
+        """A non-degenerate line has no self-intersections."""
+        return []
+
     def intersect(self, other_seg, tol=None):
         """Finds the intersections of two segments.
         returns a list of tuples (t1, t2) such that
@@ -1084,6 +1088,18 @@ class QuadraticBezier(object):
                 self.end, self.control, self.start)
         return new_quad
 
+    def self_intersections(self, tol=1e-9):
+        """Returns local parameter intervals for a collinear retracing."""
+        geom_tol = _geometry_tolerance(tol, self)
+        records = _segment_self_intersections(self, tol, geom_tol)
+        intersections = []
+        for t1, t2, t1_end, t2_end in records:
+            if t1_end is None:
+                intersections.append((t1, t2))
+            else:
+                intersections.append(((t1, t1_end), (t2, t2_end)))
+        return intersections
+
     def intersect(self, other_seg, tol=1e-12):
         """Finds the intersections of two segments.
         returns a list of tuples (t1, t2) such that
@@ -1406,6 +1422,23 @@ class CubicBezier(object):
         """returns a cropped copy of this segment which starts at
         self.point(t0) and ends at self.point(t1)."""
         return CubicBezier(*crop_bezier(self, t0, t1))
+
+    def self_intersections(self, tol=1e-9):
+        """Returns parameter pairs where this cubic intersects itself.
+
+        Isolated self-intersections are returned as ``(t1, t2)`` pairs.  A
+        collinear retracing is returned as ``((t1_start, t1_end),
+        (t2_start, t2_end))``.
+        """
+        geom_tol = _geometry_tolerance(tol, self)
+        records = _segment_self_intersections(self, tol, geom_tol)
+        intersections = []
+        for t1, t2, t1_end, t2_end in records:
+            if t1_end is None:
+                intersections.append((t1, t2))
+            else:
+                intersections.append(((t1, t1_end), (t2, t2_end)))
+        return intersections
 
     def radialrange(self, origin, return_all_global_extrema=False):
         """returns the tuples (d_min, t_min) and (d_max, t_max) which minimize
@@ -1996,6 +2029,10 @@ class Arc(object):
             degs = _deg(psi, domain_lower_limit=self.theta)
         return (degs - self.theta)/self.delta
 
+    def self_intersections(self, tol=1e-9):
+        """An elliptical arc has no self-intersections."""
+        return []
+
     def intersect(self, other_seg, tol=1e-12):
         """NOT FULLY IMPLEMENTED.  Finds the intersections of two segments.
         returns a list of tuples (t1, t2) such that
@@ -2491,6 +2528,820 @@ class Arc(object):
             yield QuadraticBezier(p_start, px + py * 1j, p_end)
             p_start = p_end
             current_t = next_t
+
+
+class SelfIntersectionSide(tuple):
+    """One side of a self-intersection.
+
+    A side is a ``(segment_index, parameter)`` tuple.  For an isolated
+    intersection ``parameter`` is a float.  For a coincident interval it is a
+    ``(t_start, t_end)`` pair.
+    """
+
+    def __new__(cls, segment_index, t_start, t_end=None):
+        parameter = t_start if t_end is None else (t_start, t_end)
+        obj = tuple.__new__(cls, (segment_index, parameter))
+        obj.segment_index = segment_index
+        obj.index = segment_index
+        obj.t_start = t_start
+        obj.t_end = t_end
+        return obj
+
+    @property
+    def t(self):
+        """The local parameter, or ``(t_start, t_end)`` for an interval."""
+        return self[1]
+
+    @property
+    def is_overlap(self):
+        """Whether this side describes a positive-length parameter interval."""
+        return self.t_end is not None
+
+
+class SelfIntersection(object):
+    """A self-intersection between two path segments.
+
+    The object is iterable as ``(side1, side2)``.  Each side is a
+    :class:`SelfIntersectionSide`, i.e. a ``(segment_index, parameter_tuple)``
+    pair.  Isolated intersections have a scalar local parameter on each side;
+    coincident intervals have ``(t_start, t_end)`` on each side.
+    """
+
+    def __init__(self, index1, t1_start, index2, t2_start,
+                 t1_end=None, t2_end=None, point=None,
+                 segment1=None, segment2=None):
+        self.side1 = SelfIntersectionSide(index1, t1_start, t1_end)
+        self.side2 = SelfIntersectionSide(index2, t2_start, t2_end)
+        self.point = point
+        self.segment1 = segment1
+        self.segment2 = segment2
+
+    @property
+    def segment1_index(self):
+        return self.side1.segment_index
+
+    @property
+    def segment2_index(self):
+        return self.side2.segment_index
+
+    @property
+    def index1(self):
+        return self.side1.segment_index
+
+    @property
+    def index2(self):
+        return self.side2.segment_index
+
+    @property
+    def seg1_index(self):
+        return self.side1.segment_index
+
+    @property
+    def seg2_index(self):
+        return self.side2.segment_index
+
+    @property
+    def segment_index1(self):
+        return self.side1.segment_index
+
+    @property
+    def segment_index2(self):
+        return self.side2.segment_index
+
+    @property
+    def t1(self):
+        return self.side1.t
+
+    @property
+    def t2(self):
+        return self.side2.t
+
+    @property
+    def t1_start(self):
+        return self.side1.t_start
+
+    @property
+    def t1_end(self):
+        return self.side1.t_end
+
+    @property
+    def t2_start(self):
+        return self.side2.t_start
+
+    @property
+    def t2_end(self):
+        return self.side2.t_end
+
+    @property
+    def parameter1(self):
+        return self.side1.t
+
+    @property
+    def parameter2(self):
+        return self.side2.t
+
+    @property
+    def is_overlap(self):
+        return self.side1.is_overlap or self.side2.is_overlap
+
+    @property
+    def kind(self):
+        return "overlap" if self.is_overlap else "point"
+
+    @property
+    def overlap(self):
+        """The two local parameter intervals, or ``None`` for a point."""
+        if not self.is_overlap:
+            return None
+        return ((self.t1_start, self.t1_end),
+                (self.t2_start, self.t2_end))
+
+    def __len__(self):
+        return 2
+
+    def __iter__(self):
+        return iter((self.side1, self.side2))
+
+    def __getitem__(self, index):
+        if isinstance(index, str):
+            return getattr(self, index)
+        return (self.side1, self.side2)[index]
+
+    def __eq__(self, other):
+        if isinstance(other, SelfIntersection):
+            return (self.side1 == other.side1 and
+                    self.side2 == other.side2)
+        try:
+            if len(other) == 2:
+                return self.side1 == other[0] and self.side2 == other[1]
+            if len(other) == 4:
+                return (self.segment1_index == other[0] and
+                        self.t1 == other[1] and
+                        self.segment2_index == other[2] and
+                        self.t2 == other[3])
+        except TypeError:
+            pass
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return NotImplemented
+        return not result
+
+    def __repr__(self):
+        if self.is_overlap:
+            return ("SelfIntersection(({}, ({!r}, {!r})), "
+                    "({}, ({!r}, {!r})))").format(
+                        self.segment1_index, self.t1_start, self.t1_end,
+                        self.segment2_index, self.t2_start, self.t2_end)
+        return "SelfIntersection(({}, {!r}), ({}, {!r}))".format(
+            self.segment1_index, self.t1_start,
+            self.segment2_index, self.t2_start)
+
+
+def _parameter_in_unit_interval(t, tol):
+    if -tol <= t < 0:
+        return 0.0
+    if 1 < t <= 1 + tol:
+        return 1.0
+    if 0 <= t <= 1:
+        return float(t)
+    return None
+
+
+def _segment_scale(*segments):
+    extents = []
+    for seg in segments:
+        xmin, xmax, ymin, ymax = seg.bbox()
+        extents.extend((xmax - xmin, ymax - ymin))
+    return max([1.0] + extents)
+
+
+def _geometry_tolerance(tol, *segments):
+    return max(1e-10, tol) * max(1.0, _segment_scale(*segments))
+
+
+def _bboxes_overlap(bbox1, bbox2, tol):
+    xmin1, xmax1, ymin1, ymax1 = bbox1
+    xmin2, xmax2, ymin2, ymax2 = bbox2
+    return not (xmax1 < xmin2 - tol or xmax2 < xmin1 - tol or
+                ymax1 < ymin2 - tol or ymax2 < ymin1 - tol)
+
+
+def _real_roots_in_unit(poly, tol):
+    if isinstance(poly, np.poly1d):
+        coeffs = poly.coeffs
+    else:
+        coeffs = np.asarray(poly)
+    coeffs = np.asarray(coeffs)
+    if coeffs.size == 0:
+        return []
+    scale = float(np.max(np.abs(coeffs)))
+    if scale == 0:
+        return []
+    first = 0
+    while (first < len(coeffs) - 1 and
+           abs(coeffs[first]) <= max(1e-14, tol * 100) * scale):
+        first += 1
+    coeffs = coeffs[first:]
+    if len(coeffs) <= 1:
+        return []
+
+    roots = []
+    imag_tol = max(1e-8, tol * 100)
+    for root in np.roots(coeffs):
+        if not np.isfinite(root.real) or not np.isfinite(root.imag):
+            continue
+        if abs(root.imag) > imag_tol:
+            continue
+        t = _parameter_in_unit_interval(float(root.real), max(1e-9, tol))
+        if t is not None:
+            roots.append(t)
+
+    roots.sort()
+    unique = []
+    param_tol = max(1e-9, tol)
+    for t in roots:
+        if not unique or abs(t - unique[-1]) > param_tol:
+            unique.append(t)
+    return unique
+
+
+def _unique_parameter_pairs(pairs, tol):
+    unique = []
+    for t1, t2 in sorted(pairs):
+        if any(abs(t1 - old1) <= tol and abs(t2 - old2) <= tol
+               for old1, old2 in unique):
+            continue
+        unique.append((t1, t2))
+    return unique
+
+
+def _points_collinear(points, tol):
+    points = list(points)
+    if len(points) < 2:
+        return None
+    origin = points[0]
+    direction_point = max(points[1:], key=lambda p: abs(p - origin))
+    direction = direction_point - origin
+    length = abs(direction)
+    if length <= tol:
+        return None
+    direction /= length
+    for point in points:
+        if abs((point - origin).real * direction.imag -
+               (point - origin).imag * direction.real) > tol:
+            return None
+    return origin, direction
+
+
+def _scalar_polynomial(seg, origin, direction):
+    coeffs = seg.poly(return_coeffs=True)
+    values = [((c / direction).real) for c in coeffs]
+    values[-1] = (((coeffs[-1] - origin) / direction).real)
+    return np.poly1d(values)
+
+
+def _scalar_branches(poly, tol):
+    critical = _real_roots_in_unit(poly.deriv(), max(tol, 1e-10))
+    points = [0.0] + [t for t in critical if 0 < t < 1] + [1.0]
+    points = sorted(set(points))
+    branches = []
+    for t0, t1 in zip(points[:-1], points[1:]):
+        if t1 - t0 <= tol:
+            continue
+        f0, f1 = float(poly(t0)), float(poly(t1))
+        branches.append((t0, t1, min(f0, f1), max(f0, f1)))
+    return branches
+
+
+def _invert_scalar_branch(poly, t0, t1, value):
+    f0, f1 = float(poly(t0)), float(poly(t1))
+    value_tol = 1e-13 * max(1.0, abs(f0), abs(f1), abs(value))
+    if abs(value - f0) <= value_tol:
+        return t0
+    if abs(value - f1) <= value_tol:
+        return t1
+    increasing = f1 >= f0
+    lo, hi = t0, t1
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        fmid = float(poly(mid))
+        if (fmid < value) == increasing:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def _collinear_pair_intersections(seg1, seg2, origin, direction, tol,
+                                  geom_tol, same_segment=False):
+    poly1 = _scalar_polynomial(seg1, origin, direction)
+    poly2 = _scalar_polynomial(seg2, origin, direction)
+    branches1 = _scalar_branches(poly1, tol)
+    branches2 = _scalar_branches(poly2, tol)
+
+    overlaps = []
+    points = []
+    for branch1_index, (a0, a1, amin, amax) in enumerate(branches1):
+        for branch2_index, (b0, b1, bmin, bmax) in enumerate(branches2):
+            if same_segment and branch1_index == branch2_index:
+                continue
+            lo, hi = max(amin, bmin), min(amax, bmax)
+            if hi - lo > geom_tol:
+                ta0 = _invert_scalar_branch(poly1, a0, a1, lo)
+                ta1 = _invert_scalar_branch(poly1, a0, a1, hi)
+                tb0 = _invert_scalar_branch(poly2, b0, b1, lo)
+                tb1 = _invert_scalar_branch(poly2, b0, b1, hi)
+                if ta0 > ta1:
+                    ta0, ta1 = ta1, ta0
+                if tb0 > tb1:
+                    tb0, tb1 = tb1, tb0
+                if same_segment and ta0 > tb0:
+                    ta0, ta1, tb0, tb1 = tb0, tb1, ta0, ta1
+                overlaps.append((ta0, tb0, ta1, tb1))
+            elif hi >= lo - geom_tol:
+                value = (lo + hi) / 2
+                ta = _invert_scalar_branch(poly1, a0, a1, value)
+                tb = _invert_scalar_branch(poly2, b0, b1, value)
+                if same_segment and abs(ta - tb) <= tol:
+                    continue
+                points.append((ta, tb))
+
+    unique_overlaps = []
+    for overlap in sorted(overlaps):
+        if any(all(abs(a - b) <= tol for a, b in zip(overlap, old))
+               for old in unique_overlaps):
+            continue
+        unique_overlaps.append(overlap)
+
+    def covered_by_overlap(t1, t2):
+        return any(o1 - tol <= t1 <= o2 + tol and
+                   min(o3, o4) - tol <= t2 <= max(o3, o4) + tol
+                   for o1, o2, o3, o4 in unique_overlaps)
+
+    unique_points = []
+    for t1, t2 in _unique_parameter_pairs(points, tol):
+        if not covered_by_overlap(t1, t2):
+            unique_points.append((t1, t2, None, None))
+    return unique_points + [o for o in unique_overlaps]
+
+
+def _line_line_intersections(line1, line2, tol, geom_tol):
+    d1 = line1.end - line1.start
+    d2 = line2.end - line2.start
+    if abs(d1) <= geom_tol or abs(d2) <= geom_tol:
+        return []
+    denominator = d1.real * d2.imag - d1.imag * d2.real
+    if abs(denominator) <= geom_tol * max(abs(d1), abs(d2)):
+        frame = _points_collinear(line1.bpoints() + line2.bpoints(), geom_tol)
+        if frame is None:
+            return []
+        return _collinear_pair_intersections(
+            line1, line2, frame[0], frame[1], tol, geom_tol)
+
+    delta = line2.start - line1.start
+    t1 = (delta.real * d2.imag - delta.imag * d2.real) / denominator
+    t2 = (delta.real * d1.imag - delta.imag * d1.real) / denominator
+    t1 = _parameter_in_unit_interval(t1, tol)
+    t2 = _parameter_in_unit_interval(t2, tol)
+    if t1 is None or t2 is None:
+        return []
+    if abs(line1.point(t1) - line2.point(t2)) > geom_tol * 10:
+        return []
+    return [(t1, t2, None, None)]
+
+
+def _line_bezier_intersections(line, bez, tol, geom_tol):
+    direction = line.end - line.start
+    line_length = abs(direction)
+    if line_length <= geom_tol:
+        return []
+    unit_direction = direction / line_length
+    transformed = [(p - line.start) / unit_direction for p in bez.bpoints()]
+    poly = np.poly1d(bezier2polynomial([p.imag for p in transformed]))
+    roots = _real_roots_in_unit(poly, tol)
+
+    intersections = []
+    for tb in roots:
+        point = bez.point(tb)
+        line_t = ((point - line.start) / unit_direction).real / line_length
+        line_t = _parameter_in_unit_interval(line_t, max(tol, 1e-8))
+        if line_t is None:
+            continue
+        if abs(line.point(line_t) - point) > geom_tol * 10:
+            continue
+        intersections.append((line_t, tb))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(intersections, tol)]
+
+
+def _collinear_bezier_intersections(collinear_seg, other_seg, origin,
+                                    direction, tol, geom_tol):
+    other_poly = other_seg.poly(return_coeffs=True)
+    perpendicular_coefficients = [
+        (coefficient / direction).imag for coefficient in other_poly
+    ]
+    perpendicular_coefficients[-1] = (
+        ((other_poly[-1] - origin) / direction).imag)
+    perpendicular = np.poly1d(perpendicular_coefficients)
+    other_parameters = _real_roots_in_unit(perpendicular, tol)
+
+    scalar_poly = _scalar_polynomial(collinear_seg, origin, direction)
+    branches = _scalar_branches(scalar_poly, tol)
+    intersections = []
+    for other_t in other_parameters:
+        point = other_seg.point(other_t)
+        if abs((point - origin).real * direction.imag -
+               (point - origin).imag * direction.real) > geom_tol * 10:
+            continue
+        value = ((point - origin) / direction).real
+        for t0, t1, fmin, fmax in branches:
+            if fmin - geom_tol <= value <= fmax + geom_tol:
+                collinear_t = _invert_scalar_branch(
+                    scalar_poly, t0, t1, value)
+                if abs(collinear_seg.point(collinear_t) - point) <= \
+                        geom_tol * 20:
+                    intersections.append((collinear_t, other_t))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(
+                intersections, max(tol, 1e-8))]
+
+
+def _refine_bezier_pair(seg1, t1, seg2, t2, tol):
+    try:
+        from scipy.optimize import least_squares
+    except ImportError:
+        least_squares = None
+
+    if least_squares is not None:
+        def residual(parameters):
+            difference = (seg1.point(parameters[0]) -
+                          seg2.point(parameters[1]))
+            return np.array([difference.real, difference.imag])
+
+        try:
+            solution = least_squares(
+                residual, [t1, t2], method="lm",
+                ftol=1e-15, xtol=1e-15, gtol=1e-15, max_nfev=200)
+            refined_t1 = _parameter_in_unit_interval(
+                float(solution.x[0]), 1e-8)
+            refined_t2 = _parameter_in_unit_interval(
+                float(solution.x[1]), 1e-8)
+            if refined_t1 is not None and refined_t2 is not None:
+                return refined_t1, refined_t2
+        except (ValueError, RuntimeError):
+            pass
+
+    for _ in range(20):
+        d1 = seg1.derivative(t1)
+        d2 = seg2.derivative(t2)
+        residual = seg1.point(t1) - seg2.point(t2)
+        det = -d1.real * d2.imag + d1.imag * d2.real
+        scale = max(abs(d1), abs(d2), 1.0)
+        if abs(det) <= 1e-14 * scale * scale:
+            break
+        dt1 = (-residual.real * (-d2.imag) +
+               residual.imag * (-d2.real)) / det
+        dt2 = (-d1.real * residual.imag +
+               d1.imag * residual.real) / det
+        next_t1 = _parameter_in_unit_interval(t1 + dt1, 0.0)
+        next_t2 = _parameter_in_unit_interval(t2 + dt2, 0.0)
+        if next_t1 is None or next_t2 is None:
+            break
+        if abs(next_t1 - t1) + abs(next_t2 - t2) <= tol:
+            t1, t2 = next_t1, next_t2
+            break
+        t1, t2 = next_t1, next_t2
+    return t1, t2
+
+
+def _bezier_pair_intersections(seg1, seg2, tol, geom_tol):
+    if seg1 == seg2:
+        return [(0.0, 0.0, 1.0, 1.0)]
+    if seg1 == seg2.reversed():
+        return [(0.0, 0.0, 1.0, 1.0)]
+
+    frame1 = _points_collinear(seg1.bpoints(), geom_tol)
+    frame2 = _points_collinear(seg2.bpoints(), geom_tol)
+    if frame1 is not None and frame2 is not None:
+        origin1, direction1 = frame1
+        if all(abs((p - origin1).real * direction1.imag -
+                   (p - origin1).imag * direction1.real) <= geom_tol
+               for p in seg2.bpoints()):
+            return _collinear_pair_intersections(
+                seg1, seg2, origin1, direction1, tol, geom_tol)
+    if frame1 is not None:
+        return _collinear_bezier_intersections(
+            seg1, seg2, frame1[0], frame1[1], tol, geom_tol)
+    if frame2 is not None:
+        intersections = _collinear_bezier_intersections(
+            seg2, seg1, frame2[0], frame2[1], tol, geom_tol)
+        return [(t2, t1, None, None)
+                for t1, t2, _, _ in intersections]
+
+    if isinstance(seg1, Line):
+        return _line_bezier_intersections(seg1, seg2, tol, geom_tol)
+    if isinstance(seg2, Line):
+        intersections = _line_bezier_intersections(
+            seg2, seg1, tol, geom_tol)
+        return [(t2, t1, None, None)
+                for t1, t2, _, _ in intersections]
+
+    max_depth = 28
+    terminal_width = max(1e-8, min(1e-5, tol * 10))
+    stack = [(seg1, 0.0, 1.0, seg2, 0.0, 1.0, 0)]
+    candidates = []
+    visited = 0
+    while stack and visited < 250000:
+        c1, a0, a1, c2, b0, b1, depth = stack.pop()
+        visited += 1
+        if not _bboxes_overlap(c1.bbox(), c2.bbox(), geom_tol):
+            continue
+        if ((depth >= max_depth or
+             (a1 - a0 <= terminal_width and b1 - b0 <= terminal_width))):
+            candidates.append(((a0 + a1) / 2, (b0 + b1) / 2))
+            continue
+
+        if a1 - a0 >= b1 - b0:
+            left, right = c1.split(0.5)
+            split = (a0 + a1) / 2
+            stack.append((right, split, a1, c2, b0, b1, depth + 1))
+            stack.append((left, a0, split, c2, b0, b1, depth + 1))
+        else:
+            left, right = c2.split(0.5)
+            split = (b0 + b1) / 2
+            stack.append((c1, a0, a1, right, split, b1, depth + 1))
+            stack.append((c1, a0, a1, left, b0, split, depth + 1))
+
+    cluster_tol = max(1e-8, tol * 100)
+    intersections = []
+    verify_tol = geom_tol * 50
+    for t1, t2 in candidates:
+        t1, t2 = _refine_bezier_pair(seg1, t1, seg2, t2, tol)
+        if abs(seg1.point(t1) - seg2.point(t2)) <= verify_tol:
+            intersections.append((t1, t2))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(intersections, cluster_tol)]
+
+
+def _arc_forward(arc, point):
+    z = (point - arc.center) * np.exp(-1j * arc.phi)
+    return z.real / arc.radius.real + 1j * z.imag / arc.radius.imag
+
+
+def _arc_t_from_angle(arc, angle, tol):
+    delta = radians(arc.delta)
+    if abs(delta) <= 1e-15:
+        return None
+    theta = radians(arc.theta)
+    base = (angle - theta) / delta
+    period = 2 * pi / delta
+    center = int(np.round((0.5 - base) / period))
+    candidates = []
+    for k in range(center - 2, center + 3):
+        t = _parameter_in_unit_interval(base + k * period,
+                                         max(1e-8, tol * 100))
+        if t is not None:
+            candidates.append(t)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda t: abs(t - 0.5))
+
+
+def _arc_t_from_point(arc, point, tol, geom_tol):
+    z = _arc_forward(arc, point)
+    if abs(z.real * z.real + z.imag * z.imag - 1) > max(geom_tol * 10, 1e-8):
+        return None
+    t = _arc_t_from_angle(arc, np.angle(z), tol)
+    if t is None:
+        return None
+    if abs(arc.point(t) - point) > max(geom_tol * 20, 1e-8):
+        return None
+    return t
+
+
+def _arc_conic_matrix(arc):
+    cosphi, sinphi = np.cos(arc.phi), np.sin(arc.phi)
+    transform = np.array([
+        [cosphi, sinphi,
+         -cosphi * arc.center.real - sinphi * arc.center.imag],
+        [-sinphi, cosphi,
+         sinphi * arc.center.real - cosphi * arc.center.imag],
+        [0.0, 0.0, 1.0]
+    ])
+    conic = np.diag([
+        1.0 / (arc.radius.real ** 2),
+        1.0 / (arc.radius.imag ** 2),
+        -1.0
+    ])
+    return transform.T.dot(conic).dot(transform)
+
+
+def _same_ellipse(arc1, arc2, tol):
+    matrix1 = _arc_conic_matrix(arc1)
+    matrix2 = _arc_conic_matrix(arc2)
+    norm1, norm2 = np.linalg.norm(matrix1), np.linalg.norm(matrix2)
+    if norm1 == 0 or norm2 == 0:
+        return False
+    matrix1 /= norm1
+    matrix2 /= norm2
+    return min(np.linalg.norm(matrix1 - matrix2),
+               np.linalg.norm(matrix1 + matrix2)) <= tol
+
+
+def _same_ellipse_intersections(arc1, arc2, tol, geom_tol):
+    events = [0.0, 1.0]
+    for point in (arc2.start, arc2.end):
+        t = _arc_t_from_point(arc1, point, tol, geom_tol)
+        if t is not None:
+            events.append(t)
+    events.sort()
+    unique_events = []
+    for t in events:
+        if not unique_events or abs(t - unique_events[-1]) > max(tol, 1e-9):
+            unique_events.append(t)
+
+    overlaps = []
+    for t0, t1 in zip(unique_events[:-1], unique_events[1:]):
+        if t1 - t0 <= max(tol, 1e-10):
+            continue
+        mid = (t0 + t1) / 2
+        point = arc1.point(mid)
+        t2 = _arc_t_from_point(arc2, point, tol, geom_tol)
+        if t2 is None:
+            continue
+        t20 = _arc_t_from_point(arc2, arc1.point(t0), tol, geom_tol)
+        t21 = _arc_t_from_point(arc2, arc1.point(t1), tol, geom_tol)
+        if t20 is None or t21 is None:
+            continue
+        if t20 > t21:
+            t20, t21 = t21, t20
+        overlaps.append((t0, t20, t1, t21))
+
+    if overlaps:
+        return overlaps
+
+    points = []
+    for t1 in (0.0, 1.0):
+        t2 = _arc_t_from_point(arc2, arc1.point(t1), tol, geom_tol)
+        if t2 is not None:
+            points.append((t1, t2))
+    for t2 in (0.0, 1.0):
+        t1 = _arc_t_from_point(arc1, arc2.point(t2), tol, geom_tol)
+        if t1 is not None:
+            points.append((t1, t2))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(points, max(tol, 1e-8))]
+
+
+def _arc_arc_intersections(arc1, arc2, tol, geom_tol):
+    if _same_ellipse(arc1, arc2, max(1e-7, geom_tol)):
+        return _same_ellipse_intersections(arc1, arc2, tol, geom_tol)
+
+    cosphi, sinphi = np.cos(arc1.phi), np.sin(arc1.phi)
+    affine = np.array([
+        [arc1.radius.real * cosphi, -arc1.radius.imag * sinphi,
+         arc1.center.real],
+        [arc1.radius.real * sinphi, arc1.radius.imag * cosphi,
+         arc1.center.imag],
+        [0.0, 0.0, 1.0]
+    ])
+    conic = affine.T.dot(_arc_conic_matrix(arc2)).dot(affine)
+    a00, a01, a02 = conic[0]
+    _, a11, a12 = conic[1]
+    _, _, a22 = conic[2]
+    A, B, C = a00, a11, 2 * a01
+    D, E = 2 * a02, 2 * a12
+    F = a22
+    coefficients = [
+        (A - B) / 2 - 0.5j * C,
+        D - 1j * E,
+        A + B + 2 * F,
+        D + 1j * E,
+        (A - B) / 2 + 0.5j * C,
+    ]
+    if max(abs(c) for c in coefficients) <= 1e-14:
+        return []
+
+    intersections = []
+    for root in np.roots(coefficients):
+        if not np.isfinite(root.real) or not np.isfinite(root.imag):
+            continue
+        magnitude = abs(root)
+        if magnitude == 0 or abs(magnitude - 1) > 1e-5:
+            continue
+        angle = np.angle(root / magnitude)
+        t1 = _arc_t_from_angle(arc1, angle, tol)
+        if t1 is None:
+            continue
+        point = arc1.point(t1)
+        t2 = _arc_t_from_point(arc2, point, tol, geom_tol)
+        if t2 is None:
+            continue
+        if abs(arc1.point(t1) - arc2.point(t2)) > geom_tol * 20:
+            continue
+        intersections.append((t1, t2))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(
+                intersections, max(tol, 1e-8))]
+
+
+def _arc_bezier_intersections(arc, bez, tol, geom_tol):
+    poly = bez.poly()
+    transformed = (poly - arc.center) * np.exp(-1j * arc.phi)
+    u = np.poly1d(real(transformed).coeffs / arc.radius.real)
+    v = np.poly1d(imag(transformed).coeffs / arc.radius.imag)
+    ellipse_equation = u * u + v * v - 1
+    roots = _real_roots_in_unit(ellipse_equation, tol)
+
+    intersections = []
+    for tb in roots:
+        point = bez.point(tb)
+        ta = _arc_t_from_point(arc, point, tol, geom_tol)
+        if ta is None:
+            continue
+        if abs(arc.point(ta) - point) > geom_tol * 20:
+            continue
+        intersections.append((ta, tb))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(
+                intersections, max(tol, 1e-8))]
+
+
+def _cubic_self_point_intersections(cubic, tol, geom_tol):
+    coeffs = cubic.poly(return_coeffs=True)
+    c3, c2, c1 = coeffs[0], coeffs[1], coeffs[2]
+    if abs(c3) <= max(1e-14, tol):
+        return []
+
+    coefficient_u = np.conj(c2) - np.conj(c3) * c2 / c3
+    coefficient_1 = np.conj(c1) - np.conj(c3) * c1 / c3
+    if abs(coefficient_u) <= max(1e-12, tol):
+        return []
+    u = -coefficient_1 / coefficient_u
+    v = u * u + (c2 / c3) * u + c1 / c3
+    roots = np.roots([1.0, -u, v])
+
+    pairs = []
+    imag_tol = max(1e-7, tol * 100)
+    for root in roots:
+        if abs(root.imag) <= imag_tol:
+            t = _parameter_in_unit_interval(float(root.real), max(tol, 1e-8))
+            if t is not None:
+                pairs.append(t)
+    if len(pairs) < 2:
+        return []
+
+    intersections = []
+    for i, t1 in enumerate(pairs):
+        for t2 in pairs[i + 1:]:
+            if abs(t1 - t2) <= max(tol, 1e-8):
+                continue
+            if abs(cubic.point(t1) - cubic.point(t2)) <= geom_tol * 20:
+                intersections.append((min(t1, t2), max(t1, t2)))
+    return [(t1, t2, None, None)
+            for t1, t2 in _unique_parameter_pairs(intersections, tol)]
+
+
+def _segment_self_intersections(seg, tol, geom_tol):
+    results = []
+    if is_bezier_segment(seg):
+        frame = _points_collinear(seg.bpoints(), geom_tol)
+        if frame is not None:
+            results.extend(_collinear_pair_intersections(
+                seg, seg, frame[0], frame[1], tol, geom_tol,
+                same_segment=True))
+    if isinstance(seg, CubicBezier) and not results:
+        results.extend(_cubic_self_point_intersections(seg, tol, geom_tol))
+    return results
+
+
+def _segment_pair_intersections(seg1, seg2, tol, geom_tol):
+    if isinstance(seg1, Line) and isinstance(seg2, Line):
+        return _line_line_intersections(seg1, seg2, tol, geom_tol)
+    if isinstance(seg1, Arc) and isinstance(seg2, Arc):
+        return _arc_arc_intersections(seg1, seg2, tol, geom_tol)
+    if isinstance(seg1, Arc):
+        return _arc_bezier_intersections(seg1, seg2, tol, geom_tol)
+    if isinstance(seg2, Arc):
+        intersections = _arc_bezier_intersections(
+            seg2, seg1, tol, geom_tol)
+        return [(t2, t1, None, None)
+                for t1, t2, _, _ in intersections]
+    return _bezier_pair_intersections(seg1, seg2, tol, geom_tol)
+
+
+def _is_normal_joint(index1, index2, nsegments, t1, t2, tol):
+    if index1 == index2:
+        return False
+    if index2 == index1 + 1 and abs(t1 - 1) <= tol and abs(t2) <= tol:
+        return True
+    if (nsegments > 1 and index1 == 0 and index2 == nsegments - 1 and
+            abs(t1) <= tol and abs(t2 - 1) <= tol):
+        return True
+    return False
 
 
 class Path(MutableSequence):
@@ -3062,6 +3913,117 @@ class Path(MutableSequence):
                                  ind not in indices2remove]
         return intersection_list
 
+    def self_intersections(self, tol=1e-9, include_overlaps=True):
+        """Finds intersections of this path with itself.
+
+        Args:
+            tol: Numerical tolerance for distinct local parameters.
+            include_overlaps: If false, positive-length coincident intervals
+                are omitted.
+
+        Returns:
+            A list of :class:`SelfIntersection` objects in stable segment-pair
+            and local-parameter order.  Each object iterates as
+            ``(side1, side2)``, where a side is ``(segment_index, parameter)``.
+            Isolated intersections use scalar parameters.  Coincident
+            intervals use ``(t_start, t_end)`` on each side and have
+            ``is_overlap == True``.
+
+        Normal joins between consecutive segments, including the closing join
+        of a closed path, are not reported.  A second relation at the same
+        point (for example a retraced joint) and positive-length overlaps are
+        still reported.
+        """
+        nsegments = len(self)
+        if nsegments == 0:
+            return []
+
+        records = []
+        for index1, seg1 in enumerate(self):
+            geom_tol = _geometry_tolerance(tol, seg1)
+            for t1, t2, t1_end, t2_end in _segment_self_intersections(
+                    seg1, tol, geom_tol):
+                records.append((index1, t1, index1, t2, t1_end, t2_end))
+
+            for index2 in range(index1 + 1, nsegments):
+                seg2 = self[index2]
+                geom_tol = _geometry_tolerance(tol, seg1, seg2)
+                for t1, t2, t1_end, t2_end in _segment_pair_intersections(
+                        seg1, seg2, tol, geom_tol):
+                    records.append(
+                        (index1, t1, index2, t2, t1_end, t2_end))
+
+        intersections = []
+        for index1, t1, index2, t2, t1_end, t2_end in records:
+            is_overlap = t1_end is not None or t2_end is not None
+            if is_overlap and not include_overlaps:
+                continue
+            if not is_overlap:
+                if _is_normal_joint(index1, index2, nsegments, t1, t2,
+                                    max(tol, 1e-7)):
+                    continue
+                if index1 == index2 and nsegments == 1 and \
+                        self.start == self.end and \
+                        abs(t1) <= max(tol, 1e-7) and \
+                        abs(t2 - 1) <= max(tol, 1e-7):
+                    continue
+
+            if is_overlap:
+                point = self[index1].point((t1 + t1_end) / 2)
+            else:
+                point = self[index1].point(t1)
+            intersections.append(SelfIntersection(
+                index1, t1, index2, t2, t1_end=t1_end, t2_end=t2_end,
+                point=point, segment1=self[index1], segment2=self[index2]))
+
+        def sort_key(intersection):
+            return (
+                intersection.segment1_index,
+                intersection.segment2_index,
+                intersection.t1_start,
+                intersection.t1_end
+                if intersection.t1_end is not None
+                else intersection.t1_start,
+                intersection.t2_start,
+                intersection.t2_end
+                if intersection.t2_end is not None
+                else intersection.t2_start,
+                intersection.is_overlap,
+            )
+
+        intersections.sort(key=sort_key)
+        return intersections
+
+    def self_intersect(self, tol=1e-9, include_overlaps=True):
+        """Alias for :meth:`self_intersections`."""
+        return self.self_intersections(
+            tol=tol, include_overlaps=include_overlaps)
+
+    def find_self_intersections(self, tol=1e-9, include_overlaps=True):
+        """Alias for :meth:`self_intersections`."""
+        return self.self_intersections(
+            tol=tol, include_overlaps=include_overlaps)
+
+    def self_intersects(self, tol=1e-9, include_overlaps=True):
+        """Alias for :meth:`self_intersections`."""
+        return self.self_intersections(
+            tol=tol, include_overlaps=include_overlaps)
+
+    def self_intersection(self, tol=1e-9, include_overlaps=True):
+        """Alias for :meth:`self_intersections`."""
+        return self.self_intersections(
+            tol=tol, include_overlaps=include_overlaps)
+
+    def has_self_intersections(self, tol=1e-9, include_overlaps=True):
+        """Returns whether this path has any self-intersections."""
+        return bool(self.self_intersections(
+            tol=tol, include_overlaps=include_overlaps))
+
+    def is_self_intersecting(self, tol=1e-9, include_overlaps=True):
+        """Alias for :meth:`has_self_intersections`."""
+        return self.has_self_intersections(
+            tol=tol, include_overlaps=include_overlaps)
+
     def bbox(self):
         """returns bounding box in the form (xmin, xmax, ymin, ymax)."""
         bbs = [seg.bbox() for seg in self._segments]
@@ -3431,3 +4393,11 @@ class Path(MutableSequence):
                 current_pos = end
 
         return segments
+
+
+def self_intersections(path, tol=1e-9, include_overlaps=True):
+    """Convenience wrapper for :meth:`Path.self_intersections`."""
+    if not isinstance(path, Path):
+        path = Path(path)
+    return path.self_intersections(
+        tol=tol, include_overlaps=include_overlaps)

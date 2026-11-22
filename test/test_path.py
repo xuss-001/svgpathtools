@@ -1471,6 +1471,164 @@ class Test_ilength(unittest.TestCase):
             lin.ilength(1)
 
 
+class Test_self_intersections(unittest.TestCase):
+
+    def assert_sides_match(self, intersection):
+        if intersection.is_overlap:
+            t1 = (intersection.t1_start + intersection.t1_end) / 2
+            t2 = (intersection.t2_start + intersection.t2_end) / 2
+        else:
+            t1, t2 = intersection.t1, intersection.t2
+        self.assertAlmostEqual(
+            intersection.segment1.point(t1),
+            intersection.segment2.point(t2),
+            delta=TOL)
+
+    def test_single_cubic_loop(self):
+        cubic = CubicBezier(0, 2 + 3j, -1 + 3j, 1)
+        intersections = Path(cubic).self_intersections()
+
+        self.assertEqual(len(intersections), 1)
+        intersection = intersections[0]
+        self.assertEqual(
+            (intersection.segment1_index, intersection.segment2_index),
+            (0, 0))
+        self.assertFalse(intersection.is_overlap)
+        self.assertAlmostEqual(intersection.t1, 0.1127016653792583,
+                               delta=1e-6)
+        self.assertAlmostEqual(intersection.t2, 0.8872983346207417,
+                               delta=1e-6)
+        self.assert_sides_match(intersection)
+
+        # A normal closing join is not a self-intersection.
+        closed_cubic = CubicBezier(0, 1 + 2j, -1 + 2j, 0)
+        self.assertEqual(
+            Path(closed_cubic).self_intersections(), [])
+
+    def test_non_adjacent_tangency(self):
+        first = QuadraticBezier(0, 0.5 + 1j, 1)
+        disconnected = Line(5 + 5j, 6 + 5j)
+        tangent = QuadraticBezier(0.125j, 0.5 + 0.875j, 1 + 0.125j)
+        intersections = Path(first, disconnected, tangent).self_intersections()
+
+        self.assertEqual(len(intersections), 1)
+        intersection = intersections[0]
+        self.assertEqual(
+            (intersection.segment1_index, intersection.segment2_index),
+            (0, 2))
+        self.assertFalse(intersection.is_overlap)
+        self.assertAlmostEqual(intersection.t1, 0.5, delta=1e-5)
+        self.assertAlmostEqual(intersection.t2, 0.5, delta=1e-5)
+        self.assert_sides_match(intersection)
+
+    def test_common_point_keeps_distinct_segment_pairs(self):
+        path = Path(
+            Line(-1, 3),
+            Line(1 - 2j, 1 + 2j),
+            Line(-1j, 2 + 1j),
+            Line(1j, 2 - 1j),
+        )
+        intersections = path.self_intersections()
+
+        self.assertEqual(len(intersections), 6)
+        self.assertEqual(
+            {(intersection.segment1_index, intersection.segment2_index)
+             for intersection in intersections},
+            {(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)})
+        for intersection in intersections:
+            self.assertFalse(intersection.is_overlap)
+            self.assertAlmostEqual(intersection.point, 1, delta=TOL)
+            self.assert_sides_match(intersection)
+
+    def test_overlapping_edge_is_an_interval(self):
+        path = Path(
+            Line(0, 2),
+            Line(2, 2 + 2j),
+            Line(0.5, 1.5),
+        )
+        intersections = path.self_intersections()
+
+        self.assertEqual(len(intersections), 1)
+        intersection = intersections[0]
+        self.assertTrue(intersection.is_overlap)
+        self.assertEqual(intersection.kind, "overlap")
+        self.assertEqual(
+            (intersection.segment1_index, intersection.segment2_index),
+            (0, 2))
+        self.assertAlmostEqual(intersection.t1_start, 0.25, delta=TOL)
+        self.assertAlmostEqual(intersection.t1_end, 0.75, delta=TOL)
+        self.assertAlmostEqual(intersection.t2_start, 0.0, delta=TOL)
+        self.assertAlmostEqual(intersection.t2_end, 1.0, delta=TOL)
+        self.assert_sides_match(intersection)
+
+    def test_joint_filtering_and_retracing(self):
+        triangle = Path(
+            Line(0, 1),
+            Line(1, 1 + 1j),
+            Line(1 + 1j, 0),
+        )
+        self.assertEqual(triangle.self_intersections(), [])
+
+        for segment in (QuadraticBezier(0, 1 + 1j, 2),
+                        CubicBezier(0, 1 + 2j, 2 + 2j, 3)):
+            self.assertEqual(
+                Path(*segment.split(0.5)).self_intersections(), [])
+
+        retraced = Path(Line(0, 1), Line(1, 0))
+        intersections = retraced.self_intersections()
+        self.assertEqual(len(intersections), 1)
+        self.assertTrue(intersections[0].is_overlap)
+        self.assertEqual(retraced.self_intersections(include_overlaps=False),
+                         [])
+
+    def test_line_quadratic_cubic_and_arc(self):
+        line = Line(-2 + 0.5j, 2 + 0.5j)
+        arc = Arc(-1j, 1 + 1j, 0, False, True, 1j)
+        intersections = Path(line, arc).self_intersections()
+
+        self.assertEqual(len(intersections), 1)
+        self.assertEqual(
+            (intersections[0].segment1_index,
+             intersections[0].segment2_index),
+            (0, 1))
+        self.assert_sides_match(intersections[0])
+
+    def test_rotated_elliptical_arc_and_overlap(self):
+        arc = Arc(2, 2 + 1j, 30, False, False, 1j)
+        line = Line(-1 + 0.5j, 3 + 0.5j)
+        intersections = Path(arc, line).self_intersections()
+
+        self.assertEqual(len(intersections), 1)
+        self.assertAlmostEqual(
+            intersections[0].t1, 0.86257015326198, delta=1e-7)
+        self.assertAlmostEqual(
+            intersections[0].t2, 0.15470213587128387, delta=1e-7)
+        self.assert_sides_match(intersections[0])
+
+        subarc = arc.cropped(0.2, 0.8)
+        overlap = Path(arc, subarc).self_intersections()
+        self.assertEqual(len(overlap), 1)
+        self.assertTrue(overlap[0].is_overlap)
+        self.assertAlmostEqual(overlap[0].t1_start, 0.2, delta=TOL)
+        self.assertAlmostEqual(overlap[0].t1_end, 0.8, delta=TOL)
+        self.assertAlmostEqual(overlap[0].t2_start, 0.0, delta=TOL)
+        self.assertAlmostEqual(overlap[0].t2_end, 1.0, delta=TOL)
+
+    def test_results_are_stable_and_input_is_unchanged(self):
+        path = Path(
+            CubicBezier(0, 2 + 3j, -1 + 3j, 1),
+            Line(5 + 5j, 6 + 5j),
+            Arc(-1j, 1 + 1j, 0, False, True, 1j),
+        )
+        before = path.d()
+        first = path.self_intersections()
+        second = path.self_intersections()
+
+        self.assertEqual(first, second)
+        self.assertEqual(path.d(), before)
+        self.assertEqual([path[i] for i in range(len(path))], list(path))
+
+
 class Test_intersect(unittest.TestCase):
     def test_intersect(self):
 

@@ -3,10 +3,12 @@ from .bezier import (bezier_point, bezier2polynomial,
                      bezier_bounding_box, bezier_intersections,
                      bezier_by_line_intersections)
 from .path import (Path, Line, QuadraticBezier, CubicBezier, Arc,
+                   SelfIntersection, SelfIntersectionSide,
                    bezier_segment, is_bezier_segment, is_path_segment,
                    is_bezier_path, concatpaths, poly2bez, bpoints2bezier,
                    closest_point_in_path, farthest_point_in_path,
-                   path_encloses_pt, bbox2path, polygon, polyline)
+                   path_encloses_pt, bbox2path, polygon, polyline,
+                   self_intersections)
 from .parser import parse_path, parse_transform, SVGSyntaxWarning
 from .paths2svg import disvg, wsvg, paths2Drawing
 from .polytools import polyroots, polyroots01, rational_limit, real, imag

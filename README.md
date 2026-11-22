@@ -453,6 +453,26 @@ disvg(paths, filename='output_intersections.svg', attributes=attributes,
 
 ![output_intersections.svg](output_intersections.svg)
 
+### Self-intersections
+
+`Path.self_intersections()` reports places where a path crosses itself,
+including an intersection inside a single cubic Bezier. Each result keeps both
+segment indices and both local parameters, so it can be mapped back to the
+original curve segments without relying on point coordinates alone.
+
+```python
+path = Path(CubicBezier(0, 2 + 3j, -1 + 3j, 1))
+for (index1, t1), (index2, t2) in path.self_intersections():
+    print(index1, t1, index2, t2)
+```
+
+Normal joins between consecutive segments and the closing join of a closed
+path are omitted. If the same joint is retraced, or if two adjacent segments
+overlap, the result is still returned. A positive-length overlap uses
+`(t_start, t_end)` for each side and has `is_overlap == True`; an isolated
+intersection uses a scalar parameter on each side. Results are sorted by
+segment pair and local parameter, and the input path is not modified.
+
 ### An Advanced Application:  Offsetting Paths
 Here we'll find the [offset curve](https://en.wikipedia.org/wiki/Parallel_curve) for a few paths.
 
