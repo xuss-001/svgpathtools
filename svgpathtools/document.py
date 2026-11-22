@@ -36,7 +36,6 @@ A Big Problem:
 # External dependencies
 from __future__ import division, absolute_import, print_function
 import os
-import collections
 import xml.etree.ElementTree as etree
 from xml.etree.ElementTree import Element, SubElement, register_namespace
 from xml.dom.minidom import parseString
@@ -80,12 +79,68 @@ CONVERSIONS = {'path': path2pathd,
 CONVERT_ONLY_PATHS = {'path': path2pathd}
 
 SVG_GROUP_TAG = 'svg:g'
+SVG_USE_TAG = 'svg:use'
+XLINK_NAMESPACE = 'http://www.w3.org/1999/xlink'
+XLINK_HREF = '{{{0}}}href'.format(XLINK_NAMESPACE)
+
+
+def _element_name(element):
+    """Return the local tag name for an ElementTree element."""
+    if not isinstance(element.tag, str):
+        return None
+    return element.tag.rsplit('}', 1)[-1]
+
+
+def _element_label(element):
+    name = _element_name(element) or 'element'
+    element_id = element.get('id')
+    if element_id:
+        return '<{0} id={1!r}>'.format(name, element_id)
+    return '<{0}>'.format(name)
+
+
+def _use_xy_transform(use_elem):
+    """Return the translation matrix contributed by a <use> x/y pair."""
+    values = []
+    for name in ('x', 'y'):
+        value = use_elem.get(name)
+        if value is None or value.strip() == '':
+            value = 0.0
+        else:
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    'Invalid <use> {0} value {1!r} on {2}'
+                    .format(name, use_elem.get(name), _element_label(use_elem)))
+            if not np.isfinite(value):
+                raise ValueError(
+                    'Non-finite <use> {0} value {1!r} on {2}'
+                    .format(name, use_elem.get(name), _element_label(use_elem)))
+        values.append(value)
+
+    transform = np.identity(3)
+    transform[0, 2] = values[0]
+    transform[1, 2] = values[1]
+    return transform
+
+
+def _build_id_index(root):
+    """Map ids to elements, retaining duplicates so references can reject them."""
+    id_index = {}
+    for element in root.iter():
+        element_id = element.get('id')
+        if element_id:
+            id_index.setdefault(element_id, []).append(element)
+    return id_index
 
 
 def flattened_paths(group, group_filter=lambda x: True,
                     path_filter=lambda x: True, path_conversions=CONVERSIONS,
                     group_search_xpath=SVG_GROUP_TAG,
-                    strict_transform_parsing=False):
+                    strict_transform_parsing=False,
+                    referenced_group_filter=None,
+                    referenced_path_filter=None):
     """Returns the paths inside a group (recursively), expressing the
     paths in the base coordinates.
 
@@ -107,6 +162,12 @@ def flattened_paths(group, group_filter=lambda x: True,
             raised when a transform attribute contains invalid syntax;
             by default invalid transform substrings are skipped with
             an SVGSyntaxWarning.
+        referenced_group_filter (callable): Group filter to use for groups
+            reached through a <use> reference. This is needed internally by
+            `flattened_paths_from_group()` so that referenced groups are not
+            rejected by that function's traversal filter.
+        referenced_path_filter (callable): Path filter to use for paths
+            reached through a <use> reference, with the same internal purpose.
     """
     if not isinstance(group, Element):
         raise TypeError('Must provide an xml.etree.Element object. '
@@ -118,48 +179,134 @@ def flattened_paths(group, group_filter=lambda x: True,
                       .format(group, group.get('id')))
         return []
 
-    # To handle the transforms efficiently, we'll traverse the tree of
-    # groups depth-first using a stack of tuples.
-    # The first entry in the tuple is a group element and the second
-    # entry is its transform. As we pop each entry in the stack, we
-    # will add all its child group elements to the stack.
-    StackElement = collections.namedtuple('StackElement',
-                                          ['group', 'transform'])
+    if referenced_group_filter is None:
+        referenced_group_filter = group_filter
+    if referenced_path_filter is None:
+        referenced_path_filter = path_filter
 
-    def new_stack_element(element, last_tf):
-        return StackElement(element, last_tf.dot(
-            parse_transform(element.get('transform'),
-                            strict=strict_transform_parsing)))
-
-    def get_relevant_children(parent, last_tf):
-        children = []
-        for elem in filter(group_filter,
-                           parent.iterfind(group_search_xpath, SVG_NAMESPACE)):
-            children.append(new_stack_element(elem, last_tf))
-        return children
-
-    stack = [new_stack_element(group, np.identity(3))]
-
+    id_index = _build_id_index(group)
     paths = []
-    while stack:
-        top = stack.pop()
 
-        # For each element type that we know how to convert into path
-        # data, parse the element after confirming that the path_filter
-        # accepts it.
-        for key, converter in path_conversions.items():
-            for path_elem in filter(path_filter, top.group.iterfind(
-                    'svg:'+key, SVG_NAMESPACE)):
-                path_tf = top.transform.dot(
-                    parse_transform(path_elem.get('transform'),
-                                    strict=strict_transform_parsing))
-                path = transform(parse_path(converter(path_elem)), path_tf)
-                path.element = path_elem
-                path.transform = path_tf
-                paths.append(path)
+    def parse_tf(element):
+        return parse_transform(element.get('transform'),
+                               strict=strict_transform_parsing)
 
-        stack.extend(get_relevant_children(top.group, top.transform))
+    def attach_metadata(path, source_element, path_tf, use_chain):
+        path.element = source_element
+        path.transform = path_tf
+        path.original_element = source_element
+        path.source_element = source_element
+        path.use_elements = tuple(use_chain)
+        path.use_chain = path.use_elements
+        use_element = path.use_elements[-1] if path.use_elements else None
+        path.use_element = use_element
+        path.instance_element = use_element
+        path.use = use_element
 
+    def emit_path(path_elem, parent_tf, use_chain):
+        converter = path_conversions[_element_name(path_elem)]
+        path_tf = parent_tf.dot(parse_tf(path_elem))
+        path = transform(parse_path(converter(path_elem)), path_tf)
+        attach_metadata(path, path_elem, path_tf, use_chain)
+        paths.append(path)
+
+    def resolve_use(use_elem):
+        href = use_elem.get('href')
+        href_attr = 'href'
+        if href is None:
+            href = use_elem.get(XLINK_HREF)
+            href_attr = 'xlink:href'
+
+        if href is None:
+            raise ValueError(
+                'Invalid <use> reference: {0} has neither href nor '
+                'xlink:href'.format(_element_label(use_elem)))
+
+        href = href.strip()
+        if not href:
+            raise ValueError(
+                'Invalid <use> reference: {0} has an empty {1}'
+                .format(_element_label(use_elem), href_attr))
+        if not href.startswith('#'):
+            raise ValueError(
+                'External <use> references are not supported: {0} {1}={2!r}'
+                .format(_element_label(use_elem), href_attr, href))
+
+        target_id = href[1:]
+        if not target_id:
+            raise ValueError(
+                'Invalid <use> reference: {0} has an empty fragment in {1}'
+                .format(_element_label(use_elem), href_attr))
+
+        matches = id_index.get(target_id, ())
+        if not matches:
+            raise ValueError(
+                "Invalid <use> reference {0!r}: no element with that id "
+                "exists in this SVG document (from {1})"
+                .format(href, _element_label(use_elem)))
+        if len(matches) > 1:
+            raise ValueError(
+                "Invalid <use> reference {0!r}: the id is ambiguous because "
+                "it occurs {1} times (from {2})"
+                .format(href, len(matches), _element_label(use_elem)))
+        return href, matches[0]
+
+    def expand_use(use_elem, parent_tf, active_targets, use_chain):
+        href, target = resolve_use(use_elem)
+        target_identity = id(target)
+        if target_identity in active_targets:
+            raise ValueError(
+                'Circular <use> reference detected for {0!r} while expanding '
+                '{1}'.format(href, _element_label(use_elem)))
+
+        content_tf = parent_tf.dot(parse_tf(use_elem)).dot(
+            _use_xy_transform(use_elem))
+        expanded_use_chain = use_chain + (use_elem,)
+        next_active_targets = active_targets | {target_identity}
+        target_name = _element_name(target)
+
+        if target_name == 'g':
+            if not referenced_group_filter(target):
+                return
+            target_tf = content_tf.dot(parse_tf(target))
+            flatten_container(target, target_tf, referenced_group_filter,
+                              referenced_path_filter, expanded_use_chain,
+                              next_active_targets)
+        elif target_name == 'use':
+            expand_use(target, content_tf, next_active_targets,
+                       expanded_use_chain)
+        elif target_name in CONVERSIONS or target_name in path_conversions:
+            if (target_name in path_conversions
+                    and referenced_path_filter(target)):
+                emit_path(target, content_tf, expanded_use_chain)
+        else:
+            raise ValueError(
+                'Unsupported <use> reference {0!r}: target {1} is not a basic '
+                'shape or a <g>'.format(href, _element_label(target)))
+
+    def flatten_container(container, container_tf, child_group_filter,
+                          child_path_filter, use_chain, active_targets):
+        group_children = {
+            id(element) for element in
+            container.iterfind(group_search_xpath, SVG_NAMESPACE)
+        }
+
+        for child in list(container):
+            child_name = _element_name(child)
+            if id(child) in group_children:
+                if child_group_filter(child):
+                    flatten_container(
+                        child, container_tf.dot(parse_tf(child)),
+                        child_group_filter, child_path_filter, use_chain,
+                        active_targets)
+            elif child_name == 'use':
+                expand_use(child, container_tf, active_targets, use_chain)
+            elif child_name in path_conversions and child_path_filter(child):
+                emit_path(child, container_tf, use_chain)
+
+    root_tf = parse_tf(group)
+    flatten_container(group, root_tf, group_filter, path_filter, (),
+                      frozenset())
     return paths
 
 
@@ -239,7 +386,9 @@ def flattened_paths_from_group(group_to_flatten, root, recursive=True,
 
     return flattened_paths(root, desired_group_filter, desired_path_filter,
                            path_conversions, group_search_xpath,
-                           strict_transform_parsing=strict_transform_parsing)
+                           strict_transform_parsing=strict_transform_parsing,
+                           referenced_group_filter=group_filter,
+                           referenced_path_filter=path_filter)
 
 
 class Document:
@@ -293,7 +442,10 @@ class Document:
         """Returns a list of all paths in the document.
 
         Note that any transform attributes are applied before returning
-        the paths.
+        the paths.  Paths instantiated by <use> references are expanded into
+        the document coordinate system. Their `element` attribute refers to
+        the original shape, while `use_element` (also available as `use` and
+        `instance_element`) refers to the <use> instance that created them.
         """
         return flattened_paths(
             self.tree.getroot(), group_filter, path_filter, path_conversions,
