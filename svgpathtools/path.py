@@ -505,6 +505,325 @@ def farthest_point_in_path(pt, path):
     return path.radialrange(pt)[1]
 
 
+# Fill-region hit testing #####################################################
+
+#: Returned by :func:`path_fill_contains_pt` when the query point lies on the
+#: path boundary (within the requested tolerance).
+BOUNDARY = None
+ON_BOUNDARY = BOUNDARY
+INSIDE = True
+OUTSIDE = False
+
+FILL_RULE_NONZERO = 'nonzero'
+FILL_RULE_EVENODD = 'evenodd'
+
+
+def _normalize_fill_rule(fill_rule):
+    if not isinstance(fill_rule, str):
+        raise ValueError("fill_rule must be 'nonzero' or 'evenodd'.")
+    normalized = fill_rule.strip().lower().replace('-', '').replace('_', '')
+    if normalized in ('nonzero', 'winding'):
+        return FILL_RULE_NONZERO
+    if normalized == 'evenodd':
+        return FILL_RULE_EVENODD
+    raise ValueError("fill_rule must be 'nonzero' or 'evenodd', not {!r}."
+                     "".format(fill_rule))
+
+
+def _dedupe_sorted(values, eps=1e-12):
+    result = []
+    for value in sorted(values):
+        if not result or abs(value - result[-1]) > eps:
+            result.append(value)
+    return result
+
+
+def _real_roots_in_interval(poly, t0=0.0, t1=1.0):
+    """Return the real roots of ``poly`` strictly inside ``(t0, t1)``."""
+    coeffs = np.asarray(poly.coeffs if hasattr(poly, 'coeffs') else poly)
+    if coeffs.size <= 1:
+        return []
+    while coeffs.size > 1 and coeffs[0] == 0:
+        coeffs = coeffs[1:]
+    if coeffs.size <= 1:
+        return []
+    roots = []
+    for root in np.roots(coeffs):
+        if abs(root.imag) > 1e-9 * (1.0 + abs(root.real)):
+            continue
+        value = float(root.real)
+        if t0 + 1e-12 < value < t1 - 1e-12:
+            roots.append(value)
+    return _dedupe_sorted(roots)
+
+
+def _segment_y_extrema(seg):
+    """Return the interior t-values where ``seg`` has a vertical tangent."""
+    if isinstance(seg, Line):
+        return []
+    if isinstance(seg, (QuadraticBezier, CubicBezier)):
+        return _real_roots_in_interval(imag(seg.poly()).deriv())
+    if isinstance(seg, Arc):
+        a0 = radians(seg.theta)
+        a1 = radians(seg.theta + seg.delta)
+        if a1 == a0:
+            return []
+        # y(a) = center.imag + A*cos(a) + B*sin(a)
+        A = seg.radius.real * sin(seg.phi)
+        B = seg.radius.imag * cos(seg.phi)
+        if abs(A) <= 1e-15 and abs(B) <= 1e-15:
+            return []
+        # y'(a) = -A*sin(a) + B*cos(a) = 0 at
+        # a = pi/2 - atan2(A, B) + k*pi.
+        base = pi / 2 - np.arctan2(A, B)
+        lo, hi = sorted((a0, a1))
+        kmin = int(ceil((lo - base) / pi))
+        kmax = int(np.floor((hi - base) / pi))
+        ts = []
+        for k in range(kmin - 1, kmax + 2):
+            t = (base + k * pi - a0) / (a1 - a0)
+            if 1e-12 < t < 1 - 1e-12:
+                ts.append(t)
+        return _dedupe_sorted(ts)
+    return []
+
+
+def _monotone_pieces(seg):
+    """Split a segment at its y-extrema so each piece is y-monotone."""
+    ts = [0.0] + _segment_y_extrema(seg) + [1.0]
+    ts = _dedupe_sorted(ts)
+    return list(zip(ts[:-1], ts[1:]))
+
+
+def _solve_crossing_parameter(seg, t0, t1, py, y_eps):
+    """Find t in [t0, t1] where a y-monotone piece crosses y == py."""
+    y0 = seg.point(t0).imag
+    y1 = seg.point(t1).imag
+    if abs(y0 - py) <= y_eps:
+        return t0
+    if abs(y1 - py) <= y_eps:
+        return t1
+
+    if isinstance(seg, Line):
+        return t0 + (t1 - t0) * (py - y0) / (y1 - y0)
+
+    lo, hi = t0, t1
+    flo = y0 - py
+    for _ in range(80):
+        mid = (lo + hi) / 2
+        fmid = seg.point(mid).imag - py
+        if fmid == 0:
+            return mid
+        if (flo > 0) == (fmid > 0):
+            lo, flo = mid, fmid
+        else:
+            hi = mid
+        if hi - lo <= 1e-15:
+            break
+    return (lo + hi) / 2
+
+
+def _crossing_info(seg, t0, t1, py, y_eps):
+    """Return ``(x, direction)`` if a monotone piece crosses the ray line."""
+    y0 = seg.point(t0).imag
+    y1 = seg.point(t1).imag
+    c0 = 0 if abs(y0 - py) <= y_eps else (1 if y0 > py else -1)
+    c1 = 0 if abs(y1 - py) <= y_eps else (1 if y1 > py else -1)
+    if (c0 > 0) == (c1 > 0):
+        return None
+    t = _solve_crossing_parameter(seg, t0, t1, py, y_eps)
+    x = seg.point(t).real
+    direction = 1 if y1 > y0 else -1
+    return x, direction
+
+
+def _numeric_closest_on_segment(pt, seg, samples=128):
+    """Numerically minimize |seg(t) - pt| for segments without radialrange."""
+    ts = np.linspace(0.0, 1.0, samples + 1)
+    ds = np.array([abs(seg.point(float(t)) - pt) for t in ts])
+
+    def refine(lo, hi):
+        ratio = (sqrt(5.0) - 1.0) / 2.0
+        a, b = float(lo), float(hi)
+        c = b - ratio * (b - a)
+        d = a + ratio * (b - a)
+        fc = abs(seg.point(c) - pt) ** 2
+        fd = abs(seg.point(d) - pt) ** 2
+        for _ in range(80):
+            if fc <= fd:
+                b, d, fd = d, c, fc
+                c = b - ratio * (b - a)
+                fc = abs(seg.point(c) - pt) ** 2
+            else:
+                a, c, fc = c, d, fd
+                d = a + ratio * (b - a)
+                fd = abs(seg.point(d) - pt) ** 2
+        t = (a + b) / 2
+        return abs(seg.point(t) - pt), t
+
+    best_d = float(ds[0])
+    best_t = 0.0
+    candidates = []
+    for i in range(samples + 1):
+        if i == 0:
+            if ds[0] <= ds[1]:
+                candidates.append((ts[0], ts[1]))
+        elif i == samples:
+            if ds[i] <= ds[i - 1]:
+                candidates.append((ts[i - 1], ts[i]))
+        elif ds[i] <= ds[i - 1] and ds[i] <= ds[i + 1]:
+            candidates.append((ts[i - 1], ts[i + 1]))
+    for lo, hi in candidates:
+        dist, t = refine(lo, hi)
+        if dist < best_d:
+            best_d, best_t = dist, t
+    return best_d, best_t
+
+
+def _distance_to_segment(pt, seg):
+    """Return ``(distance, t)`` for the closest point of ``seg`` to ``pt``."""
+    if isinstance(seg, Line):
+        delta = seg.end - seg.start
+        denom = delta.real * delta.real + delta.imag * delta.imag
+        if denom == 0:
+            t = 0.0
+        else:
+            offset = pt - seg.start
+            t = (offset.real * delta.real +
+                 offset.imag * delta.imag) / denom
+            t = min(1.0, max(0.0, t))
+        return abs(seg.point(t) - pt), t
+    if isinstance(seg, (QuadraticBezier, CubicBezier)):
+        return bezier_radialrange(seg, pt)[0]
+    return _numeric_closest_on_segment(pt, seg)
+
+
+def _fill_segments(path):
+    """Yield each contour segment, including implicit SVG closing lines."""
+    for subpath in path.continuous_subpaths():
+        segments = list(subpath)
+        if not segments:
+            continue
+        for segment in segments:
+            yield segment
+        if subpath.start != subpath.end:
+            yield Line(subpath.end, subpath.start)
+
+
+def path_fill_contains_pt(pt, path, fill_rule=FILL_RULE_NONZERO,
+                          boundary_tolerance=0.0, **kwargs):
+    """Test whether ``pt`` is inside the filled region of ``path``.
+
+    Unlike :func:`path_encloses_pt`, this function needs no known-exterior
+    point.  It applies the SVG fill rules to all contours of ``path`` at once:
+
+    * ``fill_rule='nonzero'`` uses the signed winding number.  A hole must
+      therefore run in the opposite direction from its enclosing contour.
+    * ``fill_rule='evenodd'`` uses crossing parity, so a hole produces a hole
+      regardless of the two contours' directions.
+
+    Open subpaths are treated as if closed by a straight line, exactly as SVG
+    fill rendering does, but the input ``Path`` is never modified.
+
+    Returns
+    -------
+    True
+        The point is in the filled region.
+    False
+        The point is outside the filled region.
+    None
+        The point is on the boundary, within ``boundary_tolerance``.
+
+    Parameters
+    ----------
+    pt : complex
+        Query point.
+    path : Path
+        Path whose fill region is tested.  It may contain several contours,
+        self-intersections, and line, quadratic-Bezier, cubic-Bezier or Arc
+        segments.
+    fill_rule : {'nonzero', 'evenodd'}
+        SVG fill rule to apply.
+    boundary_tolerance : float
+        Maximum Euclidean distance, in the same units as the path coordinates,
+        for a point to be reported as boundary.  The default is ``0``; a
+        machine-roundoff allowance is still added internally so points
+        obtained from ``Path.point`` are recognized as boundary points.
+
+    Other accepted keyword aliases: ``tolerance`` or ``tol``.
+    """
+    if isinstance(pt, Path) and not isinstance(path, Path):
+        pt, path = path, pt
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path object.")
+    pt = complex(pt)
+    rule = _normalize_fill_rule(fill_rule)
+
+    if 'tolerance' in kwargs:
+        boundary_tolerance = kwargs.pop('tolerance')
+    if 'tol' in kwargs:
+        boundary_tolerance = kwargs.pop('tol')
+    if kwargs:
+        raise TypeError("Unexpected keyword argument(s): {}."
+                        "".format(', '.join(sorted(kwargs))))
+    boundary_tolerance = float(boundary_tolerance)
+    if boundary_tolerance < 0:
+        raise ValueError("boundary_tolerance must be non-negative.")
+
+    segments = list(_fill_segments(path))
+    if not segments:
+        return OUTSIDE
+
+    scale = max([1.0, abs(pt)] +
+                [abs(seg.start) for seg in segments] +
+                [abs(seg.end) for seg in segments])
+    eps = 1e-12 * scale
+    distance_limit = boundary_tolerance + eps
+
+    for segment in segments:
+        distance, _ = _distance_to_segment(pt, segment)
+        if distance <= distance_limit:
+            return BOUNDARY
+
+    winding = 0
+    parity = 0
+    px, py = pt.real, pt.imag
+    for segment in segments:
+        for t0, t1 in _monotone_pieces(segment):
+            crossing = _crossing_info(segment, t0, t1, py, eps)
+            if crossing is None:
+                continue
+            x, direction = crossing
+            if x > px:
+                winding += direction
+                parity ^= 1
+
+    if rule == FILL_RULE_EVENODD:
+        return bool(parity)
+    return bool(winding)
+
+
+# Compatibility aliases: the concept is commonly called "point in path",
+# "path contains point", or a fill-rule hit test.
+path_contains_pt = path_fill_contains_pt
+path_contains_point = path_fill_contains_pt
+path_fill_rule_contains_pt = path_fill_contains_pt
+path_contains = path_fill_contains_pt
+path_fill_contains = path_fill_contains_pt
+point_in_path = path_fill_contains_pt
+
+
+def path_fill_location(pt, path, fill_rule=FILL_RULE_NONZERO,
+                       boundary_tolerance=0.0, **kwargs):
+    """Return ``'inside'``, ``'outside'``, or ``'boundary'`` for ``pt``."""
+    result = path_fill_contains_pt(
+        pt, path, fill_rule=fill_rule,
+        boundary_tolerance=boundary_tolerance, **kwargs)
+    if result is BOUNDARY:
+        return 'boundary'
+    return 'inside' if result else 'outside'
+
+
 def path_encloses_pt(pt, opt, path):
     """returns true if pt is a point enclosed by path (which must be a Path
     object satisfying path.isclosed==True).  opt is a point you know is
@@ -3184,6 +3503,24 @@ class Path(MutableSequence):
 
         opt = complex(xmin-1, ymin-1)
         return path_encloses_pt(pt, opt, other)
+
+    def fill_contains(self, pt, fill_rule=FILL_RULE_NONZERO,
+                      boundary_tolerance=0.0, **kwargs):
+        """Return whether ``pt`` lies in this path's filled region.
+
+        See :func:`path_fill_contains_pt` for the return values and the
+        meaning of the fill rule and boundary tolerance.
+        """
+        return path_fill_contains_pt(
+            pt, self, fill_rule=fill_rule,
+            boundary_tolerance=boundary_tolerance, **kwargs)
+
+    def contains(self, pt, fill_rule=FILL_RULE_NONZERO,
+                 boundary_tolerance=0.0, **kwargs):
+        """Alias for :meth:`fill_contains`."""
+        return self.fill_contains(
+            pt, fill_rule=fill_rule,
+            boundary_tolerance=boundary_tolerance, **kwargs)
 
     def approximate_arcs_with_cubics(self, error=0.1):
         """

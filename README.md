@@ -28,6 +28,7 @@ Some included tools:
 - **smooth** paths (i.e. smooth away kinks to make paths differentiable)
 - **transition maps** from path domain to segment domain and back (T2t and t2T)
 - compute **area** enclosed by a closed path
+- **hit-test** points against a path's filled region using SVG **nonzero** or **evenodd** rules
 - compute **arc length**
 - compute **inverse arc length**
 - convert RGB color tuples to hexadecimal color strings and back
@@ -211,6 +212,17 @@ wsvg(paths, attributes=attributes, svg_attributes=svg_attributes, filename='outp
 ![output1.svg](output1.svg)
 
 There will be many more examples of writing and displaying path data below.
+
+### Hit-testing a path's filled region
+
+``path_fill_contains_pt(pt, path, fill_rule='nonzero', boundary_tolerance=0)``
+tests a point against the SVG fill region without needing an external point.
+It supports multiple contours, self-intersections, open subpaths (implicitly
+closed for the test only), Bezier curves, and elliptical arcs.  ``fill_rule``
+may be ``'nonzero'`` or ``'evenodd'``.  The result is ``True`` (inside),
+``False`` (outside), or ``None`` (on the boundary); ``path_fill_location()``
+returns the labels ``'inside'``, ``'outside'``, and ``'boundary'`` instead.
+``boundary_tolerance`` is an absolute distance in path-coordinate units.
 
 ### The .point() method and transitioning between path and path segment parameterizations
 SVG Path elements and their segments have official parameterizations.

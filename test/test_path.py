@@ -3,7 +3,7 @@ from __future__ import division, absolute_import, print_function
 import os
 import time
 import unittest
-from math import sqrt, pi
+from math import sqrt, pi, cos, sin
 from operator import itemgetter
 import numpy as np
 import random
@@ -13,7 +13,8 @@ import warnings
 from svgpathtools import (
     Line, QuadraticBezier, CubicBezier, Arc, Path, poly2bez, path_encloses_pt,
     bpoints2bezier, closest_point_in_path, farthest_point_in_path,
-    is_bezier_segment, is_bezier_path, parse_path
+    is_bezier_segment, is_bezier_path, parse_path, path_fill_contains_pt,
+    path_fill_location, path_contains_pt
 )
 from svgpathtools.path import bezier_radialrange, transform
 
@@ -2046,6 +2047,151 @@ class TestPathTools(unittest.TestCase):
         #       openinbrowser=True)
         # disvg(closed_bez_path, nodes=ns2d, node_colors=ncolors,
         #       openinbrowser=True)
+
+    @staticmethod
+    def _polyline_segments(points, close=True):
+        if close:
+            points = list(points) + [points[0]]
+        return [Line(a, b) for a, b in zip(points[:-1], points[1:])]
+
+    def test_path_fill_contains_pt_holes(self):
+        outer = self._polyline_segments(
+            [0+0j, 10+0j, 10+10j, 0+10j])
+        same_direction_hole = self._polyline_segments(
+            [3+3j, 7+3j, 7+7j, 3+7j])
+        reverse_hole = self._polyline_segments(
+            [3+3j, 3+7j, 7+7j, 7+3j])
+
+        same_dir_path = Path(*(outer + same_direction_hole))
+        reverse_path = Path(*(outer + reverse_hole))
+
+        center = 5+5j
+        ring = 1+5j
+
+        # nonzero honors orientation: a same-direction hole is filled in,
+        # while a reversed hole leaves a real hole.
+        self.assertTrue(
+            path_fill_contains_pt(center, same_dir_path, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(center, reverse_path, 'nonzero'))
+
+        # evenodd ignores orientation: either hole is a hole.
+        self.assertFalse(
+            path_fill_contains_pt(center, same_dir_path, 'evenodd'))
+        self.assertFalse(
+            path_fill_contains_pt(center, reverse_path, 'evenodd'))
+
+        for path in (same_dir_path, reverse_path):
+            self.assertTrue(path_fill_contains_pt(ring, path, 'nonzero'))
+            self.assertTrue(path_fill_contains_pt(ring, path, 'evenodd'))
+            self.assertIs(path_fill_contains_pt(0+5j, path, 'nonzero'), None)
+
+        self.assertEqual(path_fill_location(center, reverse_path, 'nonzero'),
+                         'outside')
+        self.assertEqual(path_fill_location(ring, reverse_path, 'nonzero'),
+                         'inside')
+        self.assertEqual(path_fill_location(0+5j, reverse_path, 'nonzero'),
+                         'boundary')
+
+    def test_path_fill_contains_pt_self_intersection(self):
+        star_points = []
+        for idx in range(5):
+            angle = pi/2 + 2*pi*idx*2/5
+            star_points.append(
+                complex(10*cos(angle), 10*sin(angle)))
+        star = Path(*self._polyline_segments(star_points))
+
+        # The pentagram's center has winding number 2 but even crossing
+        # parity, which is the classic nonzero/evenodd distinction.
+        self.assertTrue(path_fill_contains_pt(0+0j, star, 'nonzero'))
+        self.assertFalse(path_fill_contains_pt(0+0j, star, 'evenodd'))
+        self.assertTrue(path_fill_contains_pt(0+8j, star, 'nonzero'))
+        self.assertTrue(path_fill_contains_pt(0+8j, star, 'evenodd'))
+        self.assertFalse(path_fill_contains_pt(20+20j, star, 'nonzero'))
+
+    def test_path_fill_contains_pt_curves_arcs_and_boundaries(self):
+        cubic = CubicBezier(0+0j, 0+10j, 10+10j, 10+0j)
+        cubic_path = Path(cubic, Line(10+0j, 0+0j))
+        self.assertTrue(path_fill_contains_pt(5+2j, cubic_path, 'nonzero'))
+        self.assertFalse(path_fill_contains_pt(5+8j, cubic_path, 'nonzero'))
+        self.assertIs(path_fill_contains_pt(cubic.point(0.5), cubic_path),
+                      None)
+
+        quadratic = QuadraticBezier(0+0j, 5+10j, 10+0j)
+        quadratic_path = Path(quadratic, Line(10+0j, 0+0j))
+        self.assertTrue(
+            path_fill_contains_pt(5+2j, quadratic_path, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(5+6j, quadratic_path, 'nonzero'))
+        self.assertIs(
+            path_fill_contains_pt(quadratic.point(0.5), quadratic_path),
+            None)
+
+        # Upper semicircle (sweep=False because this library uses SVG's
+        # downward-positive y convention for sweep).
+        upper_arc = Arc(-1+0j, 1+1j, 0, False, False, 1+0j)
+        half_disk = Path(upper_arc, Line(1+0j, -1+0j))
+        self.assertTrue(
+            path_fill_contains_pt(0+0.5j, half_disk, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(0-0.5j, half_disk, 'nonzero'))
+        self.assertIs(path_fill_contains_pt(0+1j, half_disk), None)
+
+        # A ray tangent to the arc's top must not change parity or winding.
+        self.assertFalse(
+            path_fill_contains_pt(-5+1j, half_disk, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(-5+1j, half_disk, 'evenodd'))
+        self.assertTrue(
+            path_fill_contains_pt(0+0.999999j, half_disk, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(0+1.000001j, half_disk, 'nonzero'))
+
+        # Near-boundary points are classified by the distance tolerance.
+        square = Path(*self._polyline_segments(
+            [0+0j, 10+0j, 10+10j, 0+10j]))
+        just_outside = -1e-8+5j
+        just_inside = 1e-8+5j
+        self.assertFalse(
+            path_fill_contains_pt(just_outside, square))
+        self.assertIs(
+            path_fill_contains_pt(just_outside, square, tol=1e-6),
+            None)
+        self.assertIs(
+            path_fill_contains_pt(just_inside, square,
+                                  boundary_tolerance=1e-6),
+            None)
+        self.assertTrue(
+            path_fill_contains_pt(just_inside, square))
+
+    def test_path_fill_contains_pt_open_and_vertex_rays(self):
+        open_square = Path(
+            Line(0+0j, 10+0j),
+            Line(10+0j, 10+10j),
+            Line(10+10j, 0+10j),
+        )
+        segments_before = list(open_square)
+        self.assertTrue(
+            path_fill_contains_pt(5+5j, open_square, 'nonzero'))
+        self.assertEqual(list(open_square), segments_before)
+        self.assertEqual(open_square.start, 0+0j)
+        self.assertEqual(open_square.end, 0+10j)
+
+        square = Path(*self._polyline_segments(
+            [0+0j, 10+0j, 10+10j, 0+10j]))
+        # These rays run through two vertices at y == 10 (tangent touch).
+        self.assertFalse(
+            path_fill_contains_pt(-5+10j, square, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(-5+10j, square, 'evenodd'))
+        self.assertFalse(
+            path_fill_contains_pt(-5+0j, square, 'nonzero'))
+        self.assertFalse(
+            path_fill_contains_pt(-5+0j, square, 'evenodd'))
+        self.assertIs(
+            path_contains_pt(5+10j, square, 'nonzero'), None)
+        self.assertTrue(
+            path_fill_contains_pt(5+9.999999j, square, 'nonzero'))
 
     def test_path_area(self):
         if not RUN_SLOW_TESTS:
