@@ -1220,6 +1220,143 @@ class TestPath(unittest.TestCase):
         self.assertEqual(path2.d(use_closed_attrib=True, rel=True), rel_s)
 
 
+class TestPathClipping(unittest.TestCase):
+    rect = (0, 10, 0, 10)
+
+    def assert_clipped_bbox(self, path, rect):
+        xmin, xmax, ymin, ymax = rect
+        for seg in path:
+            seg_xmin, seg_xmax, seg_ymin, seg_ymax = seg.bbox()
+            self.assertGreaterEqual(seg_xmin, xmin - TOL)
+            self.assertLessEqual(seg_xmax, xmax + TOL)
+            self.assertGreaterEqual(seg_ymin, ymin - TOL)
+            self.assertLessEqual(seg_ymax, ymax + TOL)
+
+    def test_clip_lines_preserves_order_and_gaps(self):
+        path = Path(
+            Line(-5 + 5j, 15 + 5j),
+            Line(5 + 20j, 15 + 20j),
+            Line(5 - 5j, 5 + 5j),
+            Line(5 + 15j, 15 + 15j),
+        )
+        original = Path(*path)
+
+        clipped = path.clip(*self.rect)
+        self.assertEqual(path, original)
+        self.assertEqual(len(clipped), 2)
+        self.assertIsInstance(clipped[0], Line)
+        self.assertIsInstance(clipped[1], Line)
+        self.assertAlmostEqual(clipped[0].start, 5j, delta=TOL)
+        self.assertAlmostEqual(clipped[0].end, 10 + 5j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].start, 5 + 0j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].end, 5 + 5j, delta=TOL)
+        self.assertNotEqual(clipped[0].end, clipped[1].start)
+        self.assert_clipped_bbox(clipped, self.rect)
+
+        self.assertEqual(path.clip(self.rect), clipped)
+
+    def test_clip_keeps_internal_closed_contour_closed(self):
+        path = Path(
+            Line(1 + 1j, 2 + 1j),
+            Line(2 + 1j, 2 + 2j),
+            Line(2 + 2j, 1 + 2j),
+            Line(1 + 2j, 1 + 1j),
+        )
+        clipped = path.clip(*self.rect)
+        self.assertEqual(clipped, path)
+        self.assertTrue(clipped.isclosed())
+
+    def test_clip_boundary_and_tangent_contact(self):
+        boundary = Path(Line(-5 + 10j, 15 + 10j)).clip(*self.rect)
+        self.assertEqual(len(boundary), 1)
+        self.assertAlmostEqual(boundary[0].start, 10j, delta=TOL)
+        self.assertAlmostEqual(boundary[0].end, 10 + 10j, delta=TOL)
+
+        tangent = QuadraticBezier(0j, 5 - 20j, 10 + 0j)
+        self.assertEqual(Path(tangent).clip(*self.rect), Path())
+
+        tangent_from_outside = QuadraticBezier(10.25j, 5 + 9.75j,
+                                               10 + 10.25j)
+        self.assertEqual(Path(tangent_from_outside).clip(*self.rect), Path())
+
+        inside_tangent = QuadraticBezier(0j, 5 + 20j, 10 + 0j)
+        clipped = Path(inside_tangent).clip(*self.rect)
+        self.assertEqual(len(clipped), 1)
+        self.assertEqual(clipped[0], inside_tangent)
+
+    def test_clip_cubic_multiple_entries(self):
+        cubic = CubicBezier(5 + 5j, 5 + 25j, 5 - 15j, 5 + 5j)
+        clipped = Path(cubic).clip(*self.rect)
+        self.assertEqual(len(clipped), 3)
+        self.assertTrue(all(isinstance(seg, CubicBezier) for seg in clipped))
+        self.assertAlmostEqual(clipped[0].start, 5 + 5j, delta=TOL)
+        self.assertAlmostEqual(clipped[0].end, 5 + 10j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].start, 5 + 10j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].end, 5 + 0j, delta=TOL)
+        self.assertAlmostEqual(clipped[2].start, 5 + 0j, delta=TOL)
+        self.assertAlmostEqual(clipped[2].end, 5 + 5j, delta=TOL)
+        self.assert_clipped_bbox(clipped, self.rect)
+
+    def test_clip_arcs(self):
+        path = Path(
+            Arc(0j, 10 + 10j, 0, 0, 0, 20 + 0j),
+            Arc(20 + 0j, 10 + 10j, 0, 0, 0, 0j),
+        )
+        clipped = path.clip(0, 10, -10, 10)
+        self.assertEqual(len(clipped), 2)
+        self.assertTrue(all(isinstance(seg, Arc) for seg in clipped))
+        self.assertAlmostEqual(clipped[0].start, 0j, delta=TOL)
+        self.assertAlmostEqual(clipped[0].end, 10 + 10j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].start, 10 - 10j, delta=TOL)
+        self.assertAlmostEqual(clipped[1].end, 0j, delta=TOL)
+        self.assert_clipped_bbox(clipped, (0, 10, -10, 10))
+
+        circle = Path(
+            Arc(10 + 0j, 10 + 10j, 0, 0, 0, -10 + 0j),
+            Arc(-10 + 0j, 10 + 10j, 0, 0, 0, 10 + 0j),
+        )
+        multiple_entries = circle.clip(-20, 20, -5, 5)
+        self.assertEqual(len(multiple_entries), 4)
+        self.assertTrue(all(isinstance(seg, Arc) for seg in multiple_entries))
+        self.assert_clipped_bbox(multiple_entries, (-20, 20, -5, 5))
+
+        inside = circle.clip(-15, 15, -15, 15)
+        self.assertEqual(len(inside), 2)
+        self.assertTrue(inside.isclosed())
+
+        tangent_circle = Path(
+            Arc(-5 + 0j, 5 + 5j, 0, 0, 0, 5 + 0j),
+            Arc(5 + 0j, 5 + 5j, 0, 0, 0, -5 + 0j),
+        )
+        self.assertEqual(tangent_circle.clip(-10, 10, 5, 10), Path())
+
+    def test_clip_reversed_path_matches_in_reverse(self):
+        path = Path(
+            Line(-5 + 3j, 15 + 3j),
+            QuadraticBezier(15 + 3j, -5 + 15j, 5 + 3j),
+            CubicBezier(5 + 5j, 5 + 25j, 5 - 15j, 5 + 5j),
+            Arc(0j, 10 + 10j, 0, 0, 0, 20 + 0j),
+            Arc(20 + 0j, 10 + 10j, 0, 0, 0, 0j),
+        )
+        clipped = path.clip(0, 10, -10, 10)
+        reverse_clipped = path.reversed().clip(0, 10, -10, 10)
+
+        self.assertEqual(len(clipped), len(reverse_clipped))
+        self.assert_clipped_bbox(reverse_clipped, (0, 10, -10, 10))
+        for forward, backward in zip(clipped, reverse_clipped.reversed()):
+            self.assertIs(type(forward), type(backward))
+            for t in np.linspace(0, 1, 5):
+                self.assertAlmostEqual(forward.point(t), backward.point(t),
+                                       delta=1e-7)
+
+    def test_clip_rejects_invalid_rectangle(self):
+        path = Path(Line(0, 1))
+        for rect in ((10, 0, 0, 10), (0, 10, 10, 0), (0, 0, 0, 0),
+                     (0, 10, 0), (0, 10, 0, float('inf')), 'bad'):
+            with self.assertRaises(ValueError):
+                path.clip(rect)
+
+
 class Test_ilength(unittest.TestCase):
     # See svgpathtools.notes.inv_arclength.py for information on how these
     # test values were generated (using the .length() method).

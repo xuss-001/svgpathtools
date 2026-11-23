@@ -4,6 +4,7 @@ Arc."""
 
 # External dependencies
 from __future__ import annotations
+import copy
 import re
 try:
     from collections.abc import MutableSequence  # noqa
@@ -2493,6 +2494,242 @@ class Arc(object):
             current_t = next_t
 
 
+def _clip_validate_rect(rect):
+    """Validate and normalize an axis-aligned clipping rectangle."""
+    try:
+        xmin, xmax, ymin, ymax = rect
+    except (TypeError, ValueError):
+        raise ValueError("A clipping rectangle must be a sequence of four "
+                         "values: (xmin, xmax, ymin, ymax).")
+
+    bounds = (xmin, xmax, ymin, ymax)
+    if any(isinstance(value, complex) for value in bounds):
+        raise ValueError("Clipping rectangle bounds must be finite real "
+                         "numbers.")
+    try:
+        bounds = tuple(float(value) for value in bounds)
+    except (TypeError, ValueError):
+        raise ValueError("Clipping rectangle bounds must be finite real "
+                         "numbers.")
+    if not all(np.isfinite(value) for value in bounds):
+        raise ValueError("Clipping rectangle bounds must be finite real "
+                         "numbers.")
+    xmin, xmax, ymin, ymax = bounds
+    if xmin >= xmax or ymin >= ymax:
+        raise ValueError("Invalid clipping rectangle: expected xmin < xmax "
+                         "and ymin < ymax.")
+    return bounds
+
+
+def _clip_param_tolerance():
+    return 1e-9
+
+
+def _clip_snap_param(t):
+    """Snap parameters that are only numerically outside [0, 1]."""
+    tol = _clip_param_tolerance()
+    if -tol <= t <= 0:
+        return 0.0
+    if 1 <= t <= 1 + tol:
+        return 1.0
+    return t
+
+
+def _clip_unique_params(params):
+    """Sort parameters and remove duplicates created by adjacent edges."""
+    tol = _clip_param_tolerance()
+    unique = []
+    for t in sorted(params):
+        t = _clip_snap_param(t)
+        if not unique or t - unique[-1] > tol:
+            unique.append(t)
+        elif t == 0.0 or t == 1.0:
+            unique[-1] = t
+    return unique
+
+
+def _clip_poly_roots_01(poly):
+    """Return real roots in [0, 1] for a real np.poly1d."""
+    coeffs = np.asarray(poly.coeffs, dtype=float)
+    if coeffs.size == 0:
+        return []
+
+    scale = float(np.max(np.abs(coeffs)))
+    if scale == 0:
+        return []
+    trim_tol = 100 * np.finfo(float).eps * scale
+    while coeffs.size > 1 and abs(coeffs[0]) <= trim_tol:
+        coeffs = coeffs[1:]
+    if coeffs.size == 1:
+        return []
+
+    roots = []
+    tol = _clip_param_tolerance()
+    for root in np.roots(coeffs):
+        if abs(root.imag) <= 1e-7 * max(1.0, abs(root.real)):
+            t = float(root.real)
+            if -tol <= t <= 1 + tol:
+                roots.append(_clip_snap_param(t))
+    return roots
+
+
+def _clip_bezier_params(seg, rect):
+    """Return all parameter values where a Bezier segment meets a rect edge."""
+    xmin, xmax, ymin, ymax = rect
+    poly = seg.poly()
+    x, y = real(poly), imag(poly)
+    params = [0.0, 1.0]
+    for coordinate, edges in ((x, (xmin, xmax)), (y, (ymin, ymax))):
+        for edge in edges:
+            params.extend(_clip_poly_roots_01(coordinate - edge))
+    return _clip_unique_params(params)
+
+
+def _clip_arc_edge_roots(arc, edge, is_x):
+    """Return arc parameters where one coordinate equals an edge value."""
+    if arc.delta == 0:
+        return []
+
+    cosphi, sinphi = arc.rot_matrix.real, arc.rot_matrix.imag
+    rx, ry = arc.radius.real, arc.radius.imag
+    if is_x:
+        a_coeff = rx * cosphi
+        b_coeff = -ry * sinphi
+        offset = arc.center.real - edge
+    else:
+        a_coeff = rx * sinphi
+        b_coeff = ry * cosphi
+        offset = arc.center.imag - edge
+
+    amplitude = np.hypot(a_coeff, b_coeff)
+    if amplitude == 0:
+        return []
+
+    ratio = -offset / amplitude
+    ratio_tol = 1e-10
+    if ratio < -1 - ratio_tol or ratio > 1 + ratio_tol:
+        return []
+
+    ratio = float(np.clip(ratio, -1, 1))
+    phase = np.arctan2(b_coeff, a_coeff)
+    alpha = np.arccos(ratio)
+    roots = []
+    param_tol = _clip_param_tolerance()
+    for k in range(-3, 4):
+        for angle in (phase + alpha + 2*np.pi*k,
+                      phase - alpha + 2*np.pi*k):
+            t = (degrees(angle) - arc.theta) / arc.delta
+            if -param_tol <= t <= 1 + param_tol:
+                roots.append(_clip_snap_param(float(t)))
+    return roots
+
+
+def _clip_arc_params(arc, rect):
+    """Return all parameter values where an Arc meets a rect edge."""
+    xmin, xmax, ymin, ymax = rect
+    params = [0.0, 1.0]
+    for edge in (xmin, xmax):
+        params.extend(_clip_arc_edge_roots(arc, edge, is_x=True))
+    for edge in (ymin, ymax):
+        params.extend(_clip_arc_edge_roots(arc, edge, is_x=False))
+    return _clip_unique_params(params)
+
+
+def _clip_point_tolerance(rect):
+    xmin, xmax, ymin, ymax = rect
+    scale = max(1.0, xmax - xmin, ymax - ymin,
+                abs(xmin), abs(xmax), abs(ymin), abs(ymax))
+    return 1e-10 * scale
+
+
+def _clip_point_in_rect(point, rect):
+    xmin, xmax, ymin, ymax = rect
+    tol = _clip_point_tolerance(rect)
+    return (xmin - tol <= point.real <= xmax + tol and
+            ymin - tol <= point.imag <= ymax + tol)
+
+
+def _clip_segment_has_extent(seg, rect):
+    """Reject numerically generated, zero-length pieces."""
+    xmin, xmax, ymin, ymax = seg.bbox()
+    tol = _clip_point_tolerance(rect)
+    return max(xmax - xmin, ymax - ymin) > tol
+
+
+def _clip_interval_is_meaningful(seg, t0, t1, piece, rect):
+    """Check that a piece has interior depth or truly lies on an edge."""
+    if not _clip_segment_has_extent(piece, rect):
+        return False
+
+    xmin, xmax, ymin, ymax = rect
+    tol = _clip_point_tolerance(rect)
+    sample_ts = t0 + np.linspace(0, 1, 17)[1:-1]*(t1 - t0)
+    points = [seg.point(t) for t in sample_ts]
+
+    for point in points:
+        if (xmin + tol < point.real < xmax - tol and
+                ymin + tol < point.imag < ymax - tol):
+            return True
+
+    edge_checks = (
+        (xmin, lambda point: point.real, lambda deriv: deriv.real),
+        (xmax, lambda point: point.real, lambda deriv: deriv.real),
+        (ymin, lambda point: point.imag, lambda deriv: deriv.imag),
+        (ymax, lambda point: point.imag, lambda deriv: deriv.imag),
+    )
+    for edge, coordinate, normal_component in edge_checks:
+        if not all(abs(coordinate(point) - edge) <= tol for point in points):
+            continue
+        derivatives = [seg.derivative(t) for t in sample_ts]
+        if all(abs(normal_component(deriv)) <= 1e-12 * abs(deriv)
+               for deriv in derivatives):
+            return True
+    return False
+
+
+def _clip_crop_segment(seg, t0, t1):
+    """Crop by parameter interval without the non-injective radialrange step."""
+    if isinstance(seg, Arc):
+        return seg.cropped(t0, t1)
+    if t0 == 0.0:
+        return seg.split(t1)[0]
+    if t1 == 1.0:
+        return seg.split(t0)[1]
+    remaining = seg.split(t0)[1]
+    return remaining.split((t1 - t0)/(1 - t0))[0]
+
+
+def _clip_segment(seg, rect):
+    """Clip one Line, QuadraticBezier, CubicBezier, or Arc to a rectangle."""
+    if isinstance(seg, Arc):
+        params = _clip_arc_params(seg, rect)
+    elif is_bezier_segment(seg):
+        params = _clip_bezier_params(seg, rect)
+    else:
+        raise TypeError("Path clipping only supports Line, QuadraticBezier, "
+                        "CubicBezier, and Arc segments.")
+
+    intervals = []
+    for t0, t1 in zip(params, params[1:]):
+        if t1 - t0 <= _clip_param_tolerance():
+            continue
+        if _clip_point_in_rect(seg.point((t0 + t1)/2), rect):
+            if intervals and t0 - intervals[-1][1] <= _clip_param_tolerance():
+                intervals[-1] = (intervals[-1][0], t1)
+            else:
+                intervals.append((t0, t1))
+
+    pieces = []
+    for t0, t1 in intervals:
+        if t0 == 0.0 and t1 == 1.0:
+            piece = copy.deepcopy(seg)
+        else:
+            piece = _clip_crop_segment(seg, t0, t1)
+        if _clip_interval_is_meaningful(seg, t0, t1, piece, rect):
+            pieces.append(piece)
+    return pieces
+
+
 class Path(MutableSequence):
     """A Path is a sequence of path segments"""
 
@@ -3071,6 +3308,32 @@ class Path(MutableSequence):
         ymin = min(ymins)
         ymax = max(ymaxs)
         return xmin, xmax, ymin, ymax
+
+    def clip(self, xmin, xmax=None, ymin=None, ymax=None):
+        """Return a copy clipped to the closed axis-aligned rectangle.
+
+        The rectangle may be passed either as four bounds in the same order
+        used by :meth:`bbox`, or as a single ``(xmin, xmax, ymin, ymax)``
+        sequence.  Portions of the path on the rectangle boundary are kept.
+        Each returned piece preserves the original segment type and direction,
+        and pieces remain in path traversal order.  Gaps caused by clipping
+        are not filled.
+        """
+        rect = (xmin, xmax, ymin, ymax)
+        if xmax is None and ymin is None and ymax is None:
+            if isinstance(xmin, Path):
+                rect = xmin.bbox()
+            else:
+                rect = xmin
+        elif xmax is None or ymin is None or ymax is None:
+            raise TypeError("clip() requires either one rectangle sequence or "
+                            "all four bounds.")
+        rect = _clip_validate_rect(rect)
+
+        segments = []
+        for seg in self:
+            segments.extend(_clip_segment(seg, rect))
+        return Path(*segments)
 
     def cropped(self, T0, T1):
         """returns a cropped copy of the path."""
